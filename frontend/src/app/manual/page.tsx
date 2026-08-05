@@ -1,10 +1,30 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useEffect, useMemo, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Navbar from '@/components/Navbar';
 import Footer from '@/components/Footer';
 import type { OccupancyGroupInfo, OccupancyZone } from '@/types';
+
+/* ─── Confidence indicator colors (matches review popup) ─── */
+const CONF_BORDER: Record<string, string> = {
+    green: '#4CAF50',
+    amber: '#FFB300',
+    red: '#E53935',
+};
+
+function ManualPageInner() {
+    // Wrap in Suspense-compatible inner component
+    return <ManualForm />;
+}
+
+export default function ManualPage() {
+    return (
+        <Suspense fallback={<div className="min-h-screen bg-[#F8F9FA] flex items-center justify-center text-slate-500">Loading…</div>}>
+            <ManualPageInner />
+        </Suspense>
+    );
+}
 
 const API_URL = '';
 
@@ -15,13 +35,18 @@ interface Preset {
     secondary: string[];
 }
 
-export default function ManualPage() {
+function ManualForm() {
     const router = useRouter();
+    const searchParams = useSearchParams();
+    const isPrefill = searchParams.get('prefill') === 'true';
 
     // Occupancy catalogue
     const [groups, setGroups] = useState<OccupancyGroupInfo[]>([]);
     const [presets, setPresets] = useState<Preset[]>([]);
     const [loading, setLoading] = useState(true);
+
+    // Confidence indicators for pre-filled fields
+    const [fieldConfidence, setFieldConfidence] = useState<Record<string, string>>({});
 
     // Form state
     const [projectName, setProjectName] = useState('');
@@ -46,6 +71,50 @@ export default function ManualPage() {
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [occSearch, setOccSearch] = useState('');
+
+    // ── Load pre-fill data from extraction pipeline ──
+    useEffect(() => {
+        if (!isPrefill) return;
+        const stored = sessionStorage.getItem('firerulx_prefill');
+        if (!stored) return;
+        try {
+            const data = JSON.parse(stored);
+            if (data._source !== 'extraction') return;
+
+            // Pre-fill form fields
+            if (data.projectName) setProjectName(data.projectName);
+            if (data.city) setCity(data.city);
+            if (data.state) setState(data.state);
+            if (data.buildingHeight) setBuildingHeight(Number(data.buildingHeight));
+            if (data.numberOfFloors) {
+                const n = Number(data.numberOfFloors);
+                setNumberOfFloors(n);
+                if (data.floorAreas && Array.isArray(data.floorAreas)) {
+                    setFloorAreas(data.floorAreas.map((a: number) => a || 0));
+                } else {
+                    setFloorAreas(Array(n).fill(0));
+                }
+            }
+            if (data.constructionType === 'type12' || data.constructionType === 'type34') {
+                setConstructionType(data.constructionType);
+            }
+            if (data.basementArea) setBasementArea(Number(data.basementArea));
+            if (data.basementCount) setBasementCount(Number(data.basementCount));
+            if (data.hasKitchen) setHasKitchen(!!data.hasKitchen);
+            if (data.sprinklerProposed) setSprinklerProposed(!!data.sprinklerProposed);
+            if (data.primaryOccupancy) setPrimaryOccupancy(data.primaryOccupancy);
+
+            // Store confidence levels
+            if (data._confidence) {
+                setFieldConfidence(data._confidence);
+            }
+
+            // Clean up — don't re-apply on navigation back
+            sessionStorage.removeItem('firerulx_prefill');
+        } catch {
+            // Ignore parse errors
+        }
+    }, [isPrefill]);
 
     useEffect(() => {
         const timer = setTimeout(() => setLoading(false), 8000);
@@ -232,7 +301,7 @@ export default function ManualPage() {
                                         <p className="text-xs font-bold text-slate-500 uppercase tracking-[0.2em]">Section 01 · Project</p>
                                     </div>
                                     <div className="p-5 grid grid-cols-1 md:grid-cols-2 gap-4">
-                                        <Field label="Project Name" testid="input-project-name">
+                                        <Field label="Project Name" testid="input-project-name" confidence={fieldConfidence.projectName}>
                                             <input
                                                 data-testid="input-project-name"
                                                 value={projectName}
@@ -241,7 +310,7 @@ export default function ManualPage() {
                                                 className="w-full px-3 py-2 border border-slate-300 rounded-none focus:border-[#0A192F] outline-none text-sm"
                                             />
                                         </Field>
-                                        <Field label="City">
+                                        <Field label="City" confidence={fieldConfidence.city}>
                                             <input
                                                 data-testid="input-city"
                                                 value={city}
@@ -250,7 +319,7 @@ export default function ManualPage() {
                                                 className="w-full px-3 py-2 border border-slate-300 rounded-none focus:border-[#0A192F] outline-none text-sm"
                                             />
                                         </Field>
-                                        <Field label="State">
+                                        <Field label="State" confidence={fieldConfidence.state}>
                                             <input
                                                 data-testid="input-state"
                                                 value={state}
@@ -259,7 +328,7 @@ export default function ManualPage() {
                                                 className="w-full px-3 py-2 border border-slate-300 rounded-none focus:border-[#0A192F] outline-none text-sm"
                                             />
                                         </Field>
-                                        <Field label="Building Status">
+                                        <Field label="Building Status" confidence={fieldConfidence.buildingStatus}>
                                             <select
                                                 data-testid="select-status"
                                                 value={buildingStatus}
@@ -315,10 +384,7 @@ export default function ManualPage() {
                                             </div>
                                         )}
 
-                                        <div>
-                                            <label className="block text-xs font-bold text-slate-500 uppercase tracking-[0.2em] mb-2">
-                                                Primary occupancy
-                                            </label>
+                                        <Field label="Primary occupancy" confidence={fieldConfidence.primaryOccupancy}>
                                             <input
                                                 type="text"
                                                 data-testid="input-occ-search"
@@ -346,7 +412,7 @@ export default function ManualPage() {
                                                     </optgroup>
                                                 ))}
                                             </select>
-                                        </div>
+                                        </Field>
 
                                         {mode === 'mixed' && (
                                             <div>
@@ -465,7 +531,7 @@ export default function ManualPage() {
                                     </div>
                                     <div className="p-5 space-y-4">
                                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                                            <Field label="Height (m)">
+                                            <Field label="Height (m)" confidence={fieldConfidence.buildingHeight}>
                                                 <input
                                                     type="number"
                                                     data-testid="input-height"
@@ -476,7 +542,7 @@ export default function ManualPage() {
                                                     min={0}
                                                 />
                                             </Field>
-                                            <Field label="Number of Floors">
+                                            <Field label="Number of Floors" confidence={fieldConfidence.numberOfFloors}>
                                                 <input
                                                     type="number"
                                                     data-testid="input-floors"
@@ -486,7 +552,7 @@ export default function ManualPage() {
                                                     min={1}
                                                 />
                                             </Field>
-                                            <Field label="Construction Type">
+                                            <Field label="Construction Type" confidence={fieldConfidence.constructionType}>
                                                 <select
                                                     data-testid="select-construction"
                                                     value={constructionType}
@@ -524,7 +590,7 @@ export default function ManualPage() {
                                         </div>
 
                                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-slate-100">
-                                            <Field label="Basement Area (m²)">
+                                            <Field label="Basement Area (m²)" confidence={fieldConfidence.basementArea}>
                                                 <input
                                                     type="number"
                                                     data-testid="input-basement-area"
@@ -534,7 +600,7 @@ export default function ManualPage() {
                                                     min={0}
                                                 />
                                             </Field>
-                                            <Field label="Basement Levels">
+                                            <Field label="Basement Levels" confidence={fieldConfidence.basementCount}>
                                                 <input
                                                     type="number"
                                                     data-testid="input-basement-count"
@@ -545,26 +611,30 @@ export default function ManualPage() {
                                                 />
                                             </Field>
                                             <div className="flex items-center gap-3 pt-6">
-                                                <label className="flex items-center gap-2 text-xs cursor-pointer">
-                                                    <input
-                                                        type="checkbox"
-                                                        data-testid="input-has-kitchen"
-                                                        checked={hasKitchen}
-                                                        onChange={(e) => setHasKitchen(e.target.checked)}
-                                                        className="w-3.5 h-3.5 accent-[#0A192F]"
-                                                    />
-                                                    Kitchen present
-                                                </label>
-                                                <label className="flex items-center gap-2 text-xs cursor-pointer">
-                                                    <input
-                                                        type="checkbox"
-                                                        data-testid="input-sprinkler"
-                                                        checked={sprinklerProposed}
-                                                        onChange={(e) => setSprinklerProposed(e.target.checked)}
-                                                        className="w-3.5 h-3.5 accent-[#0A192F]"
-                                                    />
-                                                    Sprinklers proposed
-                                                </label>
+                                                <Field label="Kitchen present" confidence={fieldConfidence.hasKitchen}>
+                                                    <label className="flex items-center gap-2 text-xs cursor-pointer mt-1">
+                                                        <input
+                                                            type="checkbox"
+                                                            data-testid="input-has-kitchen"
+                                                            checked={hasKitchen}
+                                                            onChange={(e) => setHasKitchen(e.target.checked)}
+                                                            className="w-3.5 h-3.5 accent-[#0A192F]"
+                                                        />
+                                                        Yes
+                                                    </label>
+                                                </Field>
+                                                <Field label="Sprinklers proposed" confidence={fieldConfidence.sprinklerProposed}>
+                                                    <label className="flex items-center gap-2 text-xs cursor-pointer mt-1">
+                                                        <input
+                                                            type="checkbox"
+                                                            data-testid="input-sprinkler"
+                                                            checked={sprinklerProposed}
+                                                            onChange={(e) => setSprinklerProposed(e.target.checked)}
+                                                            className="w-3.5 h-3.5 accent-[#0A192F]"
+                                                        />
+                                                        Yes
+                                                    </label>
+                                                </Field>
                                             </div>
                                         </div>
                                     </div>
@@ -627,10 +697,19 @@ export default function ManualPage() {
     );
 }
 
-function Field({ label, children, testid }: { label: string; children: React.ReactNode; testid?: string }) {
+function Field({ label, children, testid, confidence }: { label: string; children: React.ReactNode; testid?: string; confidence?: string }) {
+    const borderColor = confidence ? CONF_BORDER[confidence] : undefined;
     return (
-        <div data-testid={testid}>
-            <label className="block text-xs font-bold text-slate-500 uppercase tracking-[0.2em] mb-1.5">{label}</label>
+        <div data-testid={testid} style={borderColor ? { borderLeft: `3px solid ${borderColor}`, paddingLeft: 8 } : undefined}>
+            <div className="flex items-center gap-2 mb-1.5">
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-[0.2em]">{label}</label>
+                {confidence && confidence !== 'red' && (
+                    <span className="text-[9px] px-1 py-0.5 font-bold uppercase tracking-wider" style={{
+                        backgroundColor: confidence === 'green' ? '#E8F5E9' : '#FFF8E1',
+                        color: confidence === 'green' ? '#2E7D32' : '#F57F17',
+                    }}>detected</span>
+                )}
+            </div>
             {children}
         </div>
     );

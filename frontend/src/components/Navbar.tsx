@@ -21,14 +21,14 @@ export default function Navbar() {
 
                     <div className="flex items-center gap-6">
                         <Link
-                            href="/manual"
+                            href="/new-analysis"
                             data-testid="nav-analyze"
                             className="text-xs uppercase tracking-widest font-bold text-slate-700 hover:text-[#2962FF] transition-colors"
                         >
                             Analyze
                         </Link>
                         <Link
-                            href="/manual"
+                            href="/new-analysis"
                             data-testid="nav-start"
                             className="text-xs px-4 py-2 bg-[#0A192F] text-white uppercase tracking-widest font-bold hover:bg-slate-800 transition-colors"
                         >

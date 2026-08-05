@@ -25,7 +25,7 @@ export default function Home() {
                         </p>
                         <div className="mt-6 flex flex-wrap items-center gap-3">
                             <Link
-                                href="/manual"
+                                href="/new-analysis"
                                 data-testid="cta-start-analysis"
                                 className="inline-flex items-center gap-2 bg-[#0A192F] text-white px-5 py-3 text-xs uppercase tracking-widest font-bold hover:bg-slate-800"
                             >
