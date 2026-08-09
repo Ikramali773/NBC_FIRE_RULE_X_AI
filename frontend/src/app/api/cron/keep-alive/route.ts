@@ -11,7 +11,10 @@ export async function GET(request: Request) {
     }
     */
 
-    const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    let API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    if (API_BASE_URL && !API_BASE_URL.startsWith('http')) {
+        API_BASE_URL = `https://${API_BASE_URL}`;
+    }
     
     try {
         // Hit the root endpoint of your backend (fastapi root) to wake it up

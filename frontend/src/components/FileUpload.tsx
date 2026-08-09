@@ -91,7 +91,10 @@ export default function FileUpload() {
             const stepTimer2 = setTimeout(() => setLoadingStep(3), 8000);
             const stepTimer3 = setTimeout(() => setLoadingStep(4), 15000);
 
-            const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+            let API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+            if (API_BASE_URL && !API_BASE_URL.startsWith('http')) {
+                API_BASE_URL = `https://${API_BASE_URL}`;
+            }
             const response = await fetch(`${API_BASE_URL}/api/analyze`, {
                 method: 'POST',
                 body: formData,

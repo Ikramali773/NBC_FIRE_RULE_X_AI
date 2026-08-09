@@ -129,7 +129,10 @@ export default function NewAnalysisPage() {
             const formData = new FormData();
             formData.append('file', f);
 
-            const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+            let API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+            if (API_URL && !API_URL.startsWith('http')) {
+                API_URL = `https://${API_URL}`;
+            }
             const response = await fetch(`${API_URL}/api/extract`, {
                 method: 'POST',
                 body: formData,
