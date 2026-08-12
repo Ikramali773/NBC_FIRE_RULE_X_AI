@@ -120,6 +120,38 @@ def _field(value, confidence: str, source_stage: str, note: str = "") -> dict:
     }
 
 
+def _field_from_maybe_sourced(
+    raw,
+    source_stage_prefix: str,
+    found_note: str,
+    not_found_note: str,
+) -> dict:
+    """
+    Build a field dict from a value that may (newer pdfplumber/OCR paths) or
+    may not (legacy DWG/DXF path) carry its own per-value "source".
+
+    Green requires the value to come from real embedded text — either
+    pdfplumber ("text_label") or DXF ("dxf_text"/"dxf_geometry"). Anything
+    OCR-derived (tesseract/gemini) is capped at amber, never green, per
+    Stage 6. A bare legacy value (no "source" wrapper) is graded by the
+    document-level source_stage_prefix instead.
+    """
+    if raw is None:
+        return _field(None, "red", source_stage_prefix, not_found_note)
+
+    if isinstance(raw, dict) and "value" in raw:
+        val = raw.get("value")
+        if val is None:
+            return _field(None, "red", source_stage_prefix, not_found_note)
+        source = raw.get("source", source_stage_prefix)
+        confidence = "green" if source in ("text_label", "dxf_text", "dxf_geometry") else "amber"
+        return _field(val, confidence, source, found_note)
+
+    # Legacy plain value (bool/str) — no per-value source attached.
+    confidence = "green" if source_stage_prefix in ("stage2_pdfplumber", "stage3_ezdxf") else "amber"
+    return _field(raw, confidence, source_stage_prefix, found_note)
+
+
 def map_to_form_fields(
     extraction_data: dict,
     source_file_type: str,
@@ -194,7 +226,10 @@ def map_to_form_fields(
             floors_source = source
 
     # ── Areas ──
-    areas_list = data.get("areas", [])
+    # Basement mentions are excluded here — they're surfaced separately via
+    # basement_area_m2 below, so including them would double-count the same
+    # square-meter figure as if it were an additional floor's area.
+    areas_list = [a for a in data.get("areas", []) if not (isinstance(a, dict) and a.get("label") == "basement_area")]
     per_floor_areas = []
     if areas_list:
         for i, area in enumerate(areas_list[:20]):  # Cap at 20 floors
@@ -229,22 +264,22 @@ def map_to_form_fields(
     return {
         "source_file_type": source_file_type,
 
-        "project_name": _field(
-            project_name, "amber" if project_name else "red",
-            source_stage_prefix,
-            "Best-effort from title block" if project_name else "Not detected — you'll need to enter this manually",
+        "project_name": _field_from_maybe_sourced(
+            project_name, source_stage_prefix,
+            "Extracted from title block text.",
+            "Not detected — you'll need to enter this manually",
         ),
 
-        "city": _field(
-            city, "amber" if city else "red",
-            source_stage_prefix,
-            "Best-effort from title-block address" if city else "Not detected — you'll need to enter this manually",
+        "city": _field_from_maybe_sourced(
+            city, source_stage_prefix,
+            "Extracted from title-block address text.",
+            "Not detected — you'll need to enter this manually",
         ),
 
-        "state": _field(
-            state, "amber" if state else "red",
-            source_stage_prefix,
-            "Best-effort from title-block address" if state else "Not detected — you'll need to enter this manually",
+        "state": _field_from_maybe_sourced(
+            state, source_stage_prefix,
+            "Extracted from title-block address text.",
+            "Not detected — you'll need to enter this manually",
         ),
 
         "building_status": _field(
@@ -274,15 +309,15 @@ def map_to_form_fields(
             "Detected from drawing text" if basement_levels else "Not detected — you'll need to enter this manually",
         ),
 
-        "kitchen_present": _field(
-            kitchen, "amber" if kitchen is not None else "red",
-            source_stage_prefix,
-            "Kitchen keyword found in drawing" if kitchen else "Not detected — you'll need to enter this manually",
+        "kitchen_present": _field_from_maybe_sourced(
+            kitchen, source_stage_prefix,
+            "Kitchen keyword found in drawing.",
+            "Not detected — you'll need to enter this manually",
         ),
 
-        "sprinklers_proposed": _field(
-            sprinklers, "amber" if sprinklers is not None else "red",
-            source_stage_prefix,
-            "Sprinkler keyword found in drawing" if sprinklers else "Not detected — you'll need to enter this manually",
+        "sprinklers_proposed": _field_from_maybe_sourced(
+            sprinklers, source_stage_prefix,
+            "Sprinkler keyword found in drawing.",
+            "Not detected — you'll need to enter this manually",
         ),
     }

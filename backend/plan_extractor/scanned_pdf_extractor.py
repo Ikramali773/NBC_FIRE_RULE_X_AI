@@ -15,29 +15,45 @@ import re
 import traceback
 from typing import Optional
 
+from plan_extractor.label_categorizer import detect_floor_labels, detect_room_labels
 
-def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) -> Optional[bytes]:
+
+def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) -> tuple[Optional[bytes], Optional[str]]:
     """
     Rasterize a single PDF page to a PNG image using pdf2image.
     Requires poppler to be installed as a system package.
+
+    Returns (image_bytes, error_message). error_message is a specific,
+    diagnosable string identifying which tool failed and why — never a
+    silent None on failure.
     """
     try:
         from pdf2image import convert_from_bytes
+        from pdf2image.exceptions import PDFInfoNotInstalledError
 
-        images = convert_from_bytes(
-            file_bytes,
-            first_page=page_num + 1,
-            last_page=page_num + 1,
-            dpi=dpi,
-            fmt="png",
-        )
+        try:
+            images = convert_from_bytes(
+                file_bytes,
+                first_page=page_num + 1,
+                last_page=page_num + 1,
+                dpi=dpi,
+                fmt="png",
+            )
+        except PDFInfoNotInstalledError as e:
+            return None, (
+                "Poppler binary not found (pdftoppm/pdfinfo) — check backend "
+                f"deployment config: {e}"
+            )
+
         if images:
             buf = io.BytesIO()
             images[0].save(buf, format="PNG")
-            return buf.getvalue()
+            return buf.getvalue(), None
+        return None, f"Poppler returned no pages for page {page_num + 1}."
+    except ImportError as e:
+        return None, f"pdf2image not installed — check backend requirements.txt: {e}"
     except Exception as e:
-        print(f"[Scanned PDF] pdf2image rasterization failed: {e}")
-    return None
+        return None, f"PDF rasterization failed on page {page_num + 1}: {e}"
 
 
 def extract_with_gemini(file_bytes: bytes, page_num: int = 0) -> dict:
@@ -61,9 +77,9 @@ def extract_with_gemini(file_bytes: bytes, page_num: int = 0) -> dict:
         return result
 
     # Rasterize the page
-    image_bytes = _rasterize_pdf_page(file_bytes, page_num)
+    image_bytes, raster_error = _rasterize_pdf_page(file_bytes, page_num)
     if not image_bytes:
-        result["error"] = "Failed to rasterize PDF page for Gemini"
+        result["error"] = raster_error or "Failed to rasterize PDF page for Gemini"
         return result
 
     try:
@@ -172,9 +188,9 @@ def extract_with_tesseract(file_bytes: bytes, page_num: int = 0) -> dict:
     }
 
     # Rasterize the page
-    image_bytes = _rasterize_pdf_page(file_bytes, page_num)
+    image_bytes, raster_error = _rasterize_pdf_page(file_bytes, page_num)
     if not image_bytes:
-        result["error"] = "Failed to rasterize PDF page for Tesseract OCR"
+        result["error"] = raster_error or "Failed to rasterize PDF page for Tesseract OCR"
         return result
 
     try:
@@ -198,9 +214,9 @@ def extract_with_tesseract(file_bytes: bytes, page_num: int = 0) -> dict:
             "kitchen": None,
             "sprinklers": None,
             "basement_levels": None,
+            "floor_labels": detect_floor_labels(ocr_text),
+            "room_labels": detect_room_labels(ocr_text),
         }
-
-        text_lower = ocr_text.lower()
 
         # Height — only if keyword "height" is adjacent to a number
         h_match = re.search(r"(?:height|ht)\s*[=:]\s*(\d+\.?\d*)\s*(?:m|mtr)?", ocr_text, re.IGNORECASE)
@@ -233,6 +249,13 @@ def extract_with_tesseract(file_bytes: bytes, page_num: int = 0) -> dict:
         if re.search(r"\bsprinkler", ocr_text, re.IGNORECASE):
             data["sprinklers"] = True
 
+        # Basement — only with clear keyword context, matching the pdfplumber path
+        b_match = re.search(r"(\d+)\s*(?:basement|bsmt)\s*(?:level|floor)?s?", ocr_text, re.IGNORECASE)
+        if b_match:
+            val = int(b_match.group(1))
+            if 1 <= val <= 10:
+                data["basement_levels"] = val
+
         result["data"] = data
 
     except Exception as e:
@@ -242,49 +265,97 @@ def extract_with_tesseract(file_bytes: bytes, page_num: int = 0) -> dict:
     return result
 
 
-def extract_from_scanned_pdf(file_bytes: bytes) -> dict:
+def extract_from_scanned_pdf(file_bytes: bytes, page_numbers: Optional[list[int]] = None) -> dict:
     """
-    Extract building data from a scanned PDF.
+    Extract building data from all pages the file router flagged as scanned.
 
-    Tries Gemini (5a) first, falls through to Tesseract (5b) on any error.
+    Tries Gemini (5a) first per page, falls through to Tesseract (5b) on any
+    error. Results across pages are merged: the first non-null value found
+    for each scalar field wins, and list fields (areas, labels) are combined.
+
+    Args:
+        page_numbers: 0-indexed pages to OCR. Defaults to [0] for backward
+            compatibility when the caller doesn't know page boundaries.
     """
+    if not page_numbers:
+        page_numbers = [0]
+
     combined = {
-        "source_stage": "5b_tesseract",  # Updated if Gemini succeeds
+        "source_stage": "5b_tesseract",  # Updated if Gemini succeeds on any page
         "gemini_attempted": False,
         "gemini_succeeded": False,
         "fallback_reason": None,
-        "data": {},
+        "data": {
+            "height": None,
+            "floors": None,
+            "areas": [],
+            "scale": None,
+            "project_name": None,
+            "occupancy_hint": None,
+            "construction_keywords": [],
+            "kitchen": None,
+            "sprinklers": None,
+            "basement_levels": None,
+            "floor_labels": [],
+            "room_labels": [],
+        },
         "raw_text_labels": [],
         "warnings": [],
     }
 
-    # ── Stage 5a: Try Gemini first ──
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if api_key and api_key != "your-key-here":
-        combined["gemini_attempted"] = True
-        gemini_result = extract_with_gemini(file_bytes, page_num=0)
+    gemini_enabled = bool(api_key and api_key != "your-key-here")
 
-        if gemini_result["success"]:
-            combined["gemini_succeeded"] = True
-            combined["source_stage"] = "5a_gemini"
-            combined["data"] = gemini_result["data"]
-            combined["raw_text_labels"] = (
-                gemini_result.get("raw_text", "").split() if gemini_result.get("raw_text") else []
-            )
-            return combined
-        else:
-            combined["fallback_reason"] = gemini_result.get("error", "Unknown Gemini error")
-            combined["warnings"].append(
-                f"Gemini fallback failed, using Tesseract: {gemini_result.get('error', '')}"
-            )
+    for page_num in page_numbers:
+        page_data = None
+        page_raw_text = ""
 
-    # ── Stage 5b: Tesseract fallback ──
-    tess_result = extract_with_tesseract(file_bytes, page_num=0)
+        # ── Stage 5a: Try Gemini first for this page ──
+        if gemini_enabled:
+            combined["gemini_attempted"] = True
+            gemini_result = extract_with_gemini(file_bytes, page_num=page_num)
 
-    if tess_result["success"]:
-        combined["data"] = tess_result["data"]
-        combined["raw_text_labels"] = tess_result.get("raw_text", "").split()
-    else:
-        combined["warnings"].append(f"Tesseract also failed: {tess_result.get('error', '')}")
+            if gemini_result["success"]:
+                combined["gemini_succeeded"] = True
+                combined["source_stage"] = "5a_gemini"
+                page_data = gemini_result["data"]
+                page_raw_text = gemini_result.get("raw_text", "")
+            else:
+                combined["fallback_reason"] = gemini_result.get("error", "Unknown Gemini error")
+                combined["warnings"].append(
+                    f"Page {page_num + 1}: Gemini fallback failed, using Tesseract: "
+                    f"{gemini_result.get('error', '')}"
+                )
+
+        # ── Stage 5b: Tesseract fallback for this page ──
+        if page_data is None:
+            tess_result = extract_with_tesseract(file_bytes, page_num=page_num)
+            if tess_result["success"]:
+                page_data = tess_result["data"]
+                page_raw_text = tess_result.get("raw_text", "")
+            else:
+                combined["warnings"].append(
+                    f"Page {page_num + 1}: Tesseract also failed: {tess_result.get('error', '')}"
+                )
+
+        if not page_data:
+            continue
+
+        combined["raw_text_labels"].extend(page_raw_text.split() if page_raw_text else [])
+
+        cdata = combined["data"]
+        for scalar_key in ("height", "floors", "scale", "project_name", "occupancy_hint",
+                           "kitchen", "sprinklers", "basement_levels"):
+            if not cdata.get(scalar_key) and page_data.get(scalar_key):
+                cdata[scalar_key] = page_data[scalar_key]
+
+        cdata["areas"].extend(page_data.get("areas", []))
+        cdata["construction_keywords"].extend(page_data.get("construction_keywords", []))
+        cdata["floor_labels"].extend(page_data.get("floor_labels", []))
+        cdata["room_labels"].extend(page_data.get("room_labels", []))
+
+    cdata = combined["data"]
+    cdata["floor_labels"] = sorted(set(cdata["floor_labels"]))
+    cdata["room_labels"] = sorted(set(cdata["room_labels"]))
 
     return combined

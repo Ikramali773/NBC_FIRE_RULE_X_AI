@@ -13,6 +13,8 @@ from typing import Optional
 
 import pdfplumber
 
+from plan_extractor.label_categorizer import detect_floor_labels, detect_room_labels
+
 
 def _shoelace_area(points: list[tuple[float, float]]) -> float:
     """Compute area of a polygon using the shoelace formula."""
@@ -73,7 +75,13 @@ def _find_title_block_text(words: list[dict], page_width: float, page_height: fl
 
 
 def _extract_project_info(title_text: str) -> dict:
-    """Extract project name, city, state from title block text."""
+    """
+    Extract project name, city, state from title block text.
+
+    Each found subfield is wrapped with its source ("text_label" — direct,
+    unambiguous pdfplumber text) so the field mapper can tag it green,
+    matching how height/floors/areas are already tagged.
+    """
     result = {"project_name": None, "city": None, "state": None}
 
     # Common project name patterns
@@ -84,7 +92,7 @@ def _extract_project_info(title_text: str) -> dict:
     for pat in name_patterns:
         m = re.search(pat, title_text, re.IGNORECASE)
         if m:
-            result["project_name"] = m.group(1).strip()[:100]
+            result["project_name"] = {"value": m.group(1).strip()[:100], "source": "text_label"}
             break
 
     # Indian states/cities
@@ -106,12 +114,12 @@ def _extract_project_info(title_text: str) -> dict:
     text_upper = title_text.upper()
     for city in indian_cities:
         if city.upper() in text_upper:
-            result["city"] = city
+            result["city"] = {"value": city, "source": "text_label"}
             break
 
     for state in indian_states:
         if state.upper() in text_upper:
-            result["state"] = state
+            result["state"] = {"value": state, "source": "text_label"}
             break
 
     return result
@@ -157,18 +165,35 @@ def _detect_floor_count(all_text: str) -> Optional[dict]:
 
 
 def _detect_areas(all_text: str) -> list[dict]:
-    """Detect area values from text labels."""
+    """
+    Detect area values from text labels.
+
+    Patterns are checked most-specific-first, and a span already claimed by
+    a more specific label (e.g. "basement_area") is never also counted under
+    a broader one (e.g. "generic_area") — otherwise the same printed number
+    (like "BASEMENT AREA = 380 sqm") is double-counted into the per-floor
+    areas list under two different labels, silently corrupting floor-area
+    assignment downstream. A wrongly-duplicated area is worse than a missing
+    one, so overlap is actively avoided here rather than left to chance.
+    """
     areas = []
+    claimed_spans: list[tuple[int, int]] = []
+
+    # Most specific first — basement_area and floor_area claim their span
+    # before the generic catch-all pattern gets a chance to re-match it.
     area_patterns = [
-        (r"(?:floor\s+area|carpet\s+area|built.?up\s+area|area)\s*[=:]\s*(\d+\.?\d*)\s*(?:sq\.?\s*m|m²|sqm)?",
-         "floor_area"),
         (r"(?:basement\s+area)\s*[=:]\s*(\d+\.?\d*)\s*(?:sq\.?\s*m|m²|sqm)?",
          "basement_area"),
+        (r"(?:floor\s+area|carpet\s+area|built.?up\s+area|area)\s*[=:]\s*(\d+\.?\d*)\s*(?:sq\.?\s*m|m²|sqm)?",
+         "floor_area"),
         (r"(\d+\.?\d*)\s*(?:sq\.?\s*m|m²|sqm)",
          "generic_area"),
     ]
     for pat, label in area_patterns:
         for m in re.finditer(pat, all_text, re.IGNORECASE):
+            span = m.span()
+            if any(span[0] < end and start < span[1] for start, end in claimed_spans):
+                continue
             val = float(m.group(1))
             if 5.0 <= val <= 100000.0:  # Reasonable area range
                 areas.append({
@@ -177,6 +202,7 @@ def _detect_areas(all_text: str) -> list[dict]:
                     "source": "text_label",
                     "raw": m.group(0),
                 })
+                claimed_spans.append(span)
     return areas
 
 
@@ -285,9 +311,18 @@ def _detect_basement(all_text: str) -> dict:
     return result
 
 
-def extract_from_vector_pdf(file_bytes: bytes) -> dict:
+def extract_from_vector_pdf(file_bytes: bytes, only_pages: Optional[set] = None) -> dict:
     """
     Extract building data from a vector PDF using pdfplumber.
+
+    Args:
+        only_pages: 0-indexed page numbers to process. When None (default),
+            every page is processed — this is the original, page-router-
+            unaware behavior. When provided, pages outside this set are
+            skipped entirely, so a mixed vector+scanned document only feeds
+            its real-text pages into this (green-confidence) path; the
+            router-flagged scanned pages are handled separately by the
+            OCR path and merged back in by the pipeline.
 
     Returns a dict with all extracted fields, raw text labels,
     and geometry information.
@@ -308,6 +343,8 @@ def extract_from_vector_pdf(file_bytes: bytes) -> dict:
         "sprinklers": None,
         "basement": {"area": None, "levels": None},
         "scale": None,
+        "floor_labels": [],
+        "room_labels": [],
         "warnings": [],
     }
 
@@ -317,6 +354,9 @@ def extract_from_vector_pdf(file_bytes: bytes) -> dict:
             all_text_parts = []
 
             for page_idx, page in enumerate(pdf.pages):
+                if only_pages is not None and page_idx not in only_pages:
+                    continue
+
                 page_width = float(page.width)
                 page_height = float(page.height)
 
@@ -398,9 +438,14 @@ def extract_from_vector_pdf(file_bytes: bytes) -> dict:
             result["areas"] = _detect_areas(all_text)
             result["occupancy_hint"] = _detect_occupancy_hints(all_text)
             result["construction_type"] = _detect_construction_type(all_text)
-            result["kitchen"] = _detect_kitchen(all_text)
-            result["sprinklers"] = _detect_sprinklers(all_text)
             result["basement"] = _detect_basement(all_text)
+            result["floor_labels"] = detect_floor_labels(all_text)
+            result["room_labels"] = detect_room_labels(all_text)
+
+            if _detect_kitchen(all_text):
+                result["kitchen"] = {"value": True, "source": "text_label"}
+            if _detect_sprinklers(all_text):
+                result["sprinklers"] = {"value": True, "source": "text_label"}
 
     except Exception as e:
         result["warnings"].append(f"PDF extraction failed: {str(e)}")
