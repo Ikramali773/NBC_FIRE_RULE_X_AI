@@ -17,6 +17,7 @@
     "next": "16.1.6",
     "pdf-lib": "^1.17.1",
     "pdf.js-extract": "^0.2.1",
+    "pdfjs-dist": "^4.10.38",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },

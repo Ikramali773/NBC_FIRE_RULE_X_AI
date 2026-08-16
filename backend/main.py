@@ -92,6 +92,7 @@ from routes.analyze_simple import router as analyze_simple_router
 from routes.analyze_mixed import router as analyze_mixed_router
 from routes.report_pdf import router as report_pdf_router
 from routes.extract import router as extract_router
+from routes.placement import router as placement_router
 
 app = FastAPI(
     title="FireRuleX API",
@@ -116,6 +117,7 @@ app.include_router(analyze_simple_router)
 app.include_router(analyze_mixed_router)
 app.include_router(report_pdf_router)
 app.include_router(extract_router)
+app.include_router(placement_router)
 
 
 @app.get("/")

@@ -507,3 +507,50 @@ class AnalyzeResponse(BaseModel):
     confidence: ExtractionConfidence
     needs_confirmation: bool = Field(alias="needsConfirmation")
     meta: AnalyzeMeta
+
+
+# ── Phase 3a — Automated Equipment Placement ───────────────────────────
+
+
+class ScaleCalibrationData(BaseModel):
+    """Drawing scale, cross-referenced from printed dimension text vs
+    geometry. Always editable — never silently applied (see
+    plan_extractor/placement/scale_calibration.py)."""
+    model_config = {"populate_by_name": True}
+
+    mm_per_pt: Optional[float] = Field(alias="mmPerPt", default=None)
+    confidence: str  # "green" | "amber" | "red"
+    sample_count: int = Field(alias="sampleCount", default=0)
+    rejected_samples: int = Field(alias="rejectedSamples", default=0)
+    note: str = ""
+    editable: bool = True
+
+
+class PlacementPointData(BaseModel):
+    """One suggested fire-extinguisher location, in PDF point space (x, y
+    from the top of the page) so the frontend can position it directly on
+    a canvas-rendered page at the same coordinate system as the source PDF."""
+    model_config = {"populate_by_name": True}
+
+    index: int
+    x_pt: float = Field(alias="xPt")
+    y_pt: float = Field(alias="yPt")
+    is_junction: bool = Field(alias="isJunction", description="True if this is a corridor/circulation point")
+    location_description: str = Field(alias="locationDescription", default="")
+    clause_ref: str = Field(alias="clauseRef", default="")
+
+
+class PlacementSuggestionResponse(BaseModel):
+    """Response for POST /api/placement/suggest."""
+    model_config = {"populate_by_name": True}
+
+    page_index: int = Field(alias="pageIndex")
+    page_width_pt: float = Field(alias="pageWidthPt")
+    page_height_pt: float = Field(alias="pageHeightPt")
+    hazard_type: str = Field(alias="hazardType")
+    rating: str
+    max_area_m2: float = Field(alias="maxAreaM2")
+    coverage_radius_m: float = Field(alias="coverageRadiusM")
+    scale: ScaleCalibrationData
+    points: list[PlacementPointData] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
