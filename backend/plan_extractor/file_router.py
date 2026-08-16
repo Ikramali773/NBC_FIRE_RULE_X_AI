@@ -51,14 +51,29 @@ def _is_pdf(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 
+# Some CAD-to-PDF exporters flatten text to outlined vector paths (no real
+# text objects at all) while still drawing real wall/dimension geometry —
+# a page like that has zero extractable text but thousands of lines/curves.
+# Routing it to OCR anyway is both wrong (there's nothing scanned/rasterized
+# to read) and dangerous: OCR rasterizes every such page at high DPI, which
+# for a real multi-page CAD sheet can be slow/memory-heavy enough to crash
+# or time out the request. A page with substantial vector geometry is
+# "vector" regardless of text length — actually verified against a real
+# 7-page, zero-text-layer CAD export that was previously mis-routed to OCR.
+MIN_VECTOR_PATHS_FOR_VECTOR_PAGE = 200
+
+
 def _classify_pdf_page(page) -> str:
     """Classify a single PDF page as vector or scanned."""
     text = (page.extract_text() or "").strip()
-    # A page with fewer than 10 characters of extractable text
-    # is likely scanned/rasterized
-    if len(text) < 10:
-        return "scanned"
-    return "vector"
+    if len(text) >= 10:
+        return "vector"
+
+    path_count = len(page.lines or []) + len(page.rects or []) + len(page.curves or [])
+    if path_count >= MIN_VECTOR_PATHS_FOR_VECTOR_PAGE:
+        return "vector"
+
+    return "scanned"
 
 
 def route_file(file_bytes: bytes, filename: str) -> RouteResult:

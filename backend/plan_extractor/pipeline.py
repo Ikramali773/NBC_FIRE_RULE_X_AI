@@ -17,6 +17,8 @@ from plan_extractor.scale_detector import detect_scale
 from plan_extractor.field_mapper import map_to_form_fields
 from plan_extractor.confidence_tagger import tag_confidence
 
+MAX_OCR_PAGES_PER_REQUEST = 5
+
 
 def _empty_vector_result() -> dict:
     """Same shape as extract_from_vector_pdf's return, for when a PDF has no vector pages at all."""
@@ -131,6 +133,18 @@ def run_extraction(file_bytes: bytes, filename: str) -> dict:
             page_types = route.page_types or []
             vector_pages = {i for i, t in enumerate(page_types) if t == "vector"}
             scanned_pages = [i for i, t in enumerate(page_types) if t == "scanned"]
+
+            # OCR is expensive (rasterize + Tesseract, optionally Gemini) —
+            # cap how many pages a single request will run it on so a large
+            # multi-page scan can't make one upload hang or exhaust memory.
+            # Never silently truncated: capped pages are surfaced as a warning.
+            if len(scanned_pages) > MAX_OCR_PAGES_PER_REQUEST:
+                result["warnings"].append(
+                    f"{len(scanned_pages)} scanned page(s) found — only the first "
+                    f"{MAX_OCR_PAGES_PER_REQUEST} were OCR'd to keep this request fast; "
+                    "the rest have no extracted data."
+                )
+                scanned_pages = scanned_pages[:MAX_OCR_PAGES_PER_REQUEST]
 
             print(
                 f"[Pipeline] Routing {filename}: {len(vector_pages)} vector page(s) "

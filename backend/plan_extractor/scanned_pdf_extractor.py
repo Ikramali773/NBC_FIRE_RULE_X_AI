@@ -17,6 +17,14 @@ from typing import Optional
 
 from plan_extractor.label_categorizer import detect_floor_labels, detect_room_labels
 
+# Large-format architectural sheets (e.g. ARCH E-size, ~2400x1700 PDF points)
+# rasterized at a fixed 300 DPI produce ~10000x7000px images — tens of
+# megapixels that can be slow enough to time out the request or exhaust
+# Railway's memory. Capping the longest raster side keeps OCR usably sharp
+# on typical scanned pages while bounding worst-case memory/time on large
+# physical sheets, regardless of the source page's point dimensions.
+MAX_RASTER_DIMENSION_PX = 3000
+
 
 def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) -> tuple[Optional[bytes], Optional[str]]:
     """
@@ -37,6 +45,7 @@ def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) ->
                 first_page=page_num + 1,
                 last_page=page_num + 1,
                 dpi=dpi,
+                size=MAX_RASTER_DIMENSION_PX,
                 fmt="png",
             )
         except PDFInfoNotInstalledError as e:
