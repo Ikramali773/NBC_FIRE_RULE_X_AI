@@ -17,6 +17,12 @@
 /.next/
 /out/
 
+# this repo's frontend/ lives in a subdirectory, not the root, so the
+# anchored patterns above don't match its build output/dependencies
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
 # production
 /build
 

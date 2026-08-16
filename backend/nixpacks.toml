@@ -1,0 +1,14 @@
+# Railway/Nixpacks build config for the FastAPI backend.
+#
+# tesseract + poppler_utils are system-level packages required by
+# pytesseract (OCR) and pdf2image (PDF rasterization before OCR).
+# `pip install` alone does NOT provide these — they must be installed
+# via Nixpacks' nixPkgs phase, or the extraction module silently fails
+# only when a real file is uploaded in production.
+#
+# NOTE: this file assumes the Railway service's "Root Directory" is set
+# to `backend/` in the Railway dashboard (this is a monorepo with a
+# separate frontend/ directory deployed to Vercel). If the Railway
+# service root is instead the repo root, move this file there.
+[phases.setup]
+nixPkgs = ["tesseract", "poppler_utils"]

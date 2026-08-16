@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Navbar from '@/components/Navbar';
 import Footer from '@/components/Footer';
+import PlacementViewer from '@/components/PlacementViewer';
 import type { AnalyzeResponse, ComplianceResultItem } from '@/types';
 
 const API_URL = '';
@@ -41,6 +42,7 @@ function ResultsContent() {
     const [data, setData] = useState<AnalyzeResponse | null>(null);
     const [downloading, setDownloading] = useState(false);
     const [expandedRow, setExpandedRow] = useState<string | null>(null);
+    const [showPlacement, setShowPlacement] = useState(false);
 
     useEffect(() => {
         const stored = sessionStorage.getItem('firerulx_result');
@@ -133,6 +135,13 @@ function ResultsContent() {
                             ← New analysis
                         </button>
                         <button
+                            data-testid="placement-open-btn"
+                            onClick={() => setShowPlacement(true)}
+                            className="text-xs px-4 py-2 border border-slate-300 text-slate-700 hover:border-slate-800 uppercase tracking-widest font-bold"
+                        >
+                            🧯 Suggest Extinguisher Placement
+                        </button>
+                        <button
                             data-testid="pdf-export-btn"
                             onClick={downloadPdf}
                             disabled={downloading}
@@ -142,6 +151,10 @@ function ResultsContent() {
                         </button>
                     </div>
                 </header>
+
+                {showPlacement && (
+                    <PlacementViewer hazardType={analysis.hazardType} onClose={() => setShowPlacement(false)} />
+                )}
 
                 {/* SECTION 1: Building Summary */}
                 <Section title="1. Building Information" testid="section-building-info">

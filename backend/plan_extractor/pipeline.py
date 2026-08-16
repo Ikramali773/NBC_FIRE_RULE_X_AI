@@ -18,6 +18,70 @@ from plan_extractor.field_mapper import map_to_form_fields
 from plan_extractor.confidence_tagger import tag_confidence
 
 
+def _empty_vector_result() -> dict:
+    """Same shape as extract_from_vector_pdf's return, for when a PDF has no vector pages at all."""
+    return {
+        "raw_text_labels": [], "all_words": [], "dimension_values": [], "polygons": [],
+        "title_block": {}, "project_info": {}, "height": None, "floors": None, "areas": [],
+        "occupancy_hint": None, "construction_type": None, "kitchen": None, "sprinklers": None,
+        "basement": {"area": None, "levels": None}, "scale": None,
+        "floor_labels": [], "room_labels": [], "warnings": [],
+    }
+
+
+def _merge_pdf_extraction(vector_data: Optional[dict], scanned_result: Optional[dict]) -> dict:
+    """
+    Merge pdfplumber (Stage 2, vector pages) results with OCR (Stage 5,
+    router-flagged scanned pages) results into one extraction_data dict
+    shaped like extract_from_vector_pdf's schema.
+
+    Vector/text-based values always win when present — they're eligible for
+    green confidence. OCR only fills fields the vector pages didn't find,
+    and those fields carry their own OCR source tag so the field mapper
+    caps them at amber, per Stage 6.
+    """
+    merged = dict(vector_data) if vector_data else _empty_vector_result()
+
+    if not scanned_result:
+        return merged
+
+    ocr = scanned_result.get("data", {}) or {}
+    ocr_source = scanned_result.get("source_stage", "5b_tesseract")
+
+    merged["raw_text_labels"] = list(merged.get("raw_text_labels", [])) + list(scanned_result.get("raw_text_labels", []))
+    merged["warnings"] = list(merged.get("warnings", [])) + list(scanned_result.get("warnings", []))
+
+    if not merged.get("height") and ocr.get("height"):
+        merged["height"] = ocr["height"]
+    if not merged.get("floors") and ocr.get("floors"):
+        merged["floors"] = ocr["floors"]
+
+    project_info = dict(merged.get("project_info") or {})
+    if not project_info.get("project_name") and ocr.get("project_name"):
+        project_info["project_name"] = {"value": ocr["project_name"], "source": ocr_source}
+    merged["project_info"] = project_info
+
+    if not merged.get("kitchen") and ocr.get("kitchen"):
+        merged["kitchen"] = {"value": True, "source": ocr_source}
+    if not merged.get("sprinklers") and ocr.get("sprinklers"):
+        merged["sprinklers"] = {"value": True, "source": ocr_source}
+
+    if not merged.get("occupancy_hint") and ocr.get("occupancy_hint"):
+        merged["occupancy_hint"] = {"hint": ocr["occupancy_hint"], "proposed_code": None}
+
+    merged["areas"] = list(merged.get("areas", [])) + list(ocr.get("areas", []))
+
+    basement = dict(merged.get("basement") or {"area": None, "levels": None})
+    if basement.get("levels") is None and ocr.get("basement_levels") is not None:
+        basement["levels"] = ocr["basement_levels"]
+    merged["basement"] = basement
+
+    merged["floor_labels"] = sorted(set(list(merged.get("floor_labels", [])) + list(ocr.get("floor_labels", []))))
+    merged["room_labels"] = sorted(set(list(merged.get("room_labels", [])) + list(ocr.get("room_labels", []))))
+
+    return merged
+
+
 def run_extraction(file_bytes: bytes, filename: str) -> dict:
     """
     Run the full extraction pipeline on an uploaded file.
@@ -55,12 +119,44 @@ def run_extraction(file_bytes: bytes, filename: str) -> dict:
         raw_text_labels = []
         dxf_header_units = None
 
-        # ━━━ Stage 2: Vector PDF ━━━
-        if file_type == FileType.VECTOR_PDF:
-            print(f"[Pipeline] Routing to Stage 2 (Vector PDF): {filename}")
-            extraction_data = extract_from_vector_pdf(file_bytes)
+        # ━━━ Stage 2 + 5: PDF, routed per-page ━━━
+        # The router classifies pages individually (route.page_types), but the
+        # overall file_type above is only a majority-vote label used for
+        # display/source-stage purposes. Every vector page always goes through
+        # pdfplumber (Stage 2, green-eligible); every page the router actually
+        # flagged as scanned goes through OCR (Stage 5) — regardless of which
+        # path "wins" the document-level label. This handles mixed PDFs
+        # correctly instead of forcing the whole document down one path.
+        if file_type in (FileType.VECTOR_PDF, FileType.SCANNED_PDF):
+            page_types = route.page_types or []
+            vector_pages = {i for i, t in enumerate(page_types) if t == "vector"}
+            scanned_pages = [i for i, t in enumerate(page_types) if t == "scanned"]
+
+            print(
+                f"[Pipeline] Routing {filename}: {len(vector_pages)} vector page(s) "
+                f"(Stage 2), {len(scanned_pages)} scanned page(s) (Stage 5)"
+            )
+
+            vector_data = extract_from_vector_pdf(file_bytes, only_pages=vector_pages) if vector_pages else None
+            scanned_result = extract_from_scanned_pdf(file_bytes, page_numbers=scanned_pages) if scanned_pages else None
+
+            extraction_data = _merge_pdf_extraction(vector_data, scanned_result)
             raw_text_labels = extraction_data.get("raw_text_labels", [])
             result["warnings"].extend(extraction_data.get("warnings", []))
+
+            if scanned_result:
+                if scanned_result.get("gemini_attempted"):
+                    if scanned_result.get("gemini_succeeded"):
+                        result["warnings"].append("Used Gemini vision for scanned page(s).")
+                    else:
+                        result["warnings"].append(
+                            f"Gemini failed on scanned page(s), fell back to Tesseract. "
+                            f"Reason: {scanned_result.get('fallback_reason', 'unknown')}"
+                        )
+                else:
+                    result["warnings"].append(
+                        "No Gemini API key configured — used Tesseract OCR for scanned page(s)."
+                    )
 
         # ━━━ Stage 4 → 3: DWG → DXF ━━━
         elif file_type == FileType.DWG:
@@ -86,30 +182,6 @@ def run_extraction(file_bytes: bytes, filename: str) -> dict:
                 # Clean up temp files
                 if conversion.dxf_path:
                     cleanup_temp_dir(conversion.dxf_path)
-
-        # ━━━ Stage 5: Scanned PDF ━━━
-        elif file_type == FileType.SCANNED_PDF:
-            print(f"[Pipeline] Routing to Stage 5 (Scanned PDF): {filename}")
-            scanned_result = extract_from_scanned_pdf(file_bytes)
-            extraction_data = scanned_result.get("data", {})
-            extraction_data["source_stage"] = scanned_result.get("source_stage", "stage5")
-
-            # Add metadata about Gemini vs Tesseract path
-            if scanned_result.get("gemini_attempted"):
-                if scanned_result.get("gemini_succeeded"):
-                    result["warnings"].append("Used Gemini vision for scanned PDF extraction.")
-                else:
-                    result["warnings"].append(
-                        f"Gemini failed, fell back to Tesseract OCR. "
-                        f"Reason: {scanned_result.get('fallback_reason', 'unknown')}"
-                    )
-            else:
-                result["warnings"].append(
-                    "No Gemini API key configured — used Tesseract OCR for scanned PDF."
-                )
-
-            raw_text_labels = scanned_result.get("raw_text_labels", [])
-            result["warnings"].extend(scanned_result.get("warnings", []))
 
         else:
             result["error"] = f"Unsupported file type: {file_type}"

@@ -5,6 +5,8 @@
 # Mounts all API routes under /api/*.
 
 import os
+import shutil
+import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -15,8 +17,61 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _check_ocr_dependencies() -> None:
+    """
+    Verify Tesseract and Poppler are actually installed and runnable on this
+    host. Both are system-level packages that `pip install` does not
+    provide — pytesseract/pdf2image import fine even when the underlying
+    binaries are missing, so failures otherwise only surface later when a
+    real file is uploaded. Logging this at boot makes that failure mode
+    immediately visible in deployment logs instead.
+    """
+    missing = []
+
+    tesseract_path = shutil.which("tesseract")
+    if tesseract_path is None:
+        missing.append("tesseract (binary not found on PATH)")
+    else:
+        try:
+            subprocess.run(
+                ["tesseract", "--version"],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as e:
+            missing.append(f"tesseract (found on PATH but failed to run: {e})")
+
+    poppler_path = shutil.which("pdftoppm")
+    if poppler_path is None:
+        missing.append("poppler/pdftoppm (binary not found on PATH)")
+    else:
+        try:
+            # pdftoppm -v exits non-zero on some poppler builds even when
+            # working correctly, so just confirm the process launches.
+            subprocess.run(
+                ["pdftoppm", "-v"],
+                capture_output=True,
+                timeout=10,
+            )
+        except Exception as e:
+            missing.append(f"poppler/pdftoppm (found on PATH but failed to run: {e})")
+
+    if missing:
+        print("━" * 60)
+        print(f"  OCR dependencies: MISSING — {'; '.join(missing)}")
+        print("  Check deployment config (e.g. backend/nixpacks.toml on Railway).")
+        print("━" * 60)
+    else:
+        print("━" * 60)
+        print("  OCR dependencies: READY")
+        print("━" * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Startup: Verify Tesseract + Poppler are installed and runnable ──
+    _check_ocr_dependencies()
+
     # ── Startup: Log Gemini API key status ──
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if gemini_key and gemini_key != "your-key-here":
@@ -37,6 +92,7 @@ from routes.analyze_simple import router as analyze_simple_router
 from routes.analyze_mixed import router as analyze_mixed_router
 from routes.report_pdf import router as report_pdf_router
 from routes.extract import router as extract_router
+from routes.placement import router as placement_router
 
 app = FastAPI(
     title="FireRuleX API",
@@ -61,6 +117,7 @@ app.include_router(analyze_simple_router)
 app.include_router(analyze_mixed_router)
 app.include_router(report_pdf_router)
 app.include_router(extract_router)
+app.include_router(placement_router)
 
 
 @app.get("/")
