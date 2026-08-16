@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -20,6 +21,8 @@ from plan_extractor.scale_detector import detect_scale
 from plan_extractor.pipeline import run_extraction, _merge_pdf_extraction
 from plan_extractor.field_mapper import map_to_form_fields
 from plan_extractor.confidence_tagger import tag_confidence
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _make_vector_pdf(lines: list[str]) -> bytes:
@@ -136,6 +139,27 @@ class TestFileRouter:
         route = route_file(pdf_bytes, "mixed.pdf")
         assert route.page_types == ["vector", "scanned"]
 
+    def test_dense_geometry_page_with_no_text_layer_is_vector_not_scanned(self):
+        """Regression test for a real production failure: a 7-page CAD export
+        (ALL_BASIC_DRAWING.pdf) has zero extractable text on every page (its
+        fonts are flattened to outlined vector paths) but thousands of real
+        lines/curves per page. Before this fix, zero-length text alone routed
+        every page to OCR — rasterizing 7 large-format sheets at once was
+        slow/memory-heavy enough to crash the request ("Failed to fetch" in
+        the browser). Real structural vector geometry must win over an empty
+        text layer."""
+        pdf_bytes = (FIXTURES / "ALL_BASIC_DRAWING.pdf").read_bytes()
+        route = route_file(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
+        assert route.file_type == FileType.VECTOR_PDF
+        assert all(t == "vector" for t in route.page_types)
+
+    def test_genuinely_scanned_photo_pdf_still_routes_to_scanned(self):
+        """Same fix must not misclassify an actual scan (no text, no vector
+        geometry, one embedded raster image) as vector."""
+        pdf_bytes = (FIXTURES / "Appr_Layout_Plan_scanned.pdf").read_bytes()
+        route = route_file(pdf_bytes, "Appr_Layout_Plan.pdf")
+        assert route.file_type == FileType.SCANNED_PDF
+
 
 class TestMergePdfExtraction:
     """Stage 2+5 merge — vector-page results always win; OCR only fills gaps."""
@@ -207,6 +231,18 @@ class TestRunExtractionIntegration:
 
         assert result["success"] is True
         assert data_has_specific_poppler_warning(result)
+
+    def test_real_zero_text_cad_file_completes_without_crashing(self):
+        """Regression test for the real 'Failed to fetch' production bug:
+        a 7-page, zero-text-layer CAD file was being misrouted entirely to
+        OCR and never completed. It must now go down the fast vector path
+        and finish successfully, even though every field ends up red/null
+        (this specific file genuinely has no extractable text — that's an
+        honest result, not a bug)."""
+        pdf_bytes = (FIXTURES / "ALL_BASIC_DRAWING.pdf").read_bytes()
+        result = run_extraction(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
+        assert result["success"] is True
+        assert result["data"]["_extraction_quality"]["total_fields"] > 0
 
 
 def data_has_specific_poppler_warning(result: dict) -> bool:
