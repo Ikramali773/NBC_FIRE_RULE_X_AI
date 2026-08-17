@@ -21,6 +21,7 @@ from plan_extractor.scale_detector import detect_scale
 from plan_extractor.pipeline import run_extraction, _merge_pdf_extraction
 from plan_extractor.field_mapper import map_to_form_fields
 from plan_extractor.confidence_tagger import tag_confidence
+from plan_extractor.scanned_pdf_extractor import _effective_dpi, TARGET_DPI, MAX_RASTER_DIMENSION_PX
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -64,6 +65,28 @@ class TestScaleDetector:
     def test_do_not_scale_alongside_real_scale_still_detects_the_real_one(self):
         result = detect_scale(text_labels=["DO", "NOT", "SCALE", "THE", "DRAWING", "SCALE", "1:200"])
         assert result["value"] == "1:200"
+
+    def test_recognizes_civil_site_plan_scale_notation(self):
+        """Regression test for a real site-plan drawing that uses '1 CM = 2.00 MT'
+        (civil/site-plan convention) instead of the '1:100' architectural ratio
+        the detector previously only understood."""
+        result = detect_scale(text_labels=["SCALE", "1", "CM", "=", "2.00", "MT"])
+        assert result["value"] == "1:200"
+        assert result["confidence"] != "red"
+
+    def test_multiple_distinct_scales_are_surfaced_not_silently_picked(self):
+        """Regression test for a real multi-scale sheet (main plan + key plan +
+        section detail, each printed at a different scale): finding several
+        DIFFERENT scale values must not silently resolve to one of them as if
+        it were unambiguous — the note must list every candidate."""
+        result = detect_scale(text_labels=["SCALE", "1:200", "KEY", "PLAN", "SCALE", "1:2000"])
+        assert result["value"] in ("1:200", "1:2000")
+        assert "1:200" in result["note"] and "1:2000" in result["note"]
+
+    def test_single_scale_mention_is_not_flagged_as_ambiguous(self):
+        result = detect_scale(text_labels=["SCALE", "1:200"])
+        assert result["value"] == "1:200"
+        assert "multiple" not in result["note"].lower()
 
 
 class TestVectorPdfExtraction:
@@ -194,6 +217,32 @@ class TestMergePdfExtraction:
         assert merged["kitchen"] == {"value": True, "source": "text_label"}
 
 
+class TestEffectiveDpi:
+    """Regression tests for a real quality bug: a flat pixel-size cap passed
+    to pdf2image always resizes to that dimension, even DOWNSCALING a normal
+    A4-ish scanned page that was never at risk of being too large — verified
+    to measurably lose OCR-readable text on a real low-resolution scan.
+    Effective DPI must only drop below the target for genuinely oversized
+    sheets, based on the page's actual point dimensions."""
+
+    def test_normal_page_keeps_full_target_dpi(self):
+        pdf_bytes = _make_blank_pdf(pages=1)  # A4-ish page size
+        assert _effective_dpi(pdf_bytes, 0) == TARGET_DPI
+
+    def test_oversized_sheet_dpi_is_capped(self):
+        buf = io.BytesIO()
+        # A large-format sheet, e.g. ~2400x1700 PDF points (ARCH E-ish).
+        c = canvas.Canvas(buf, pagesize=(2400, 1700))
+        c.showPage()
+        c.save()
+        pdf_bytes = buf.getvalue()
+
+        dpi = _effective_dpi(pdf_bytes, 0)
+        assert dpi < TARGET_DPI
+        longest_px = 2400 / 72 * dpi
+        assert longest_px <= MAX_RASTER_DIMENSION_PX + 1  # rounding tolerance
+
+
 class TestRunExtractionIntegration:
     def test_vector_pdf_end_to_end_produces_green_confidence_fields(self):
         pdf_bytes = _make_vector_pdf([
@@ -243,6 +292,31 @@ class TestRunExtractionIntegration:
         result = run_extraction(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
         assert result["success"] is True
         assert result["data"]["_extraction_quality"]["total_fields"] > 0
+
+    def test_tesseract_uses_sparse_text_mode_not_default(self, monkeypatch):
+        """Regression test for a real quality bug: Tesseract's default page-
+        segmentation mode (PSM 3, assumes flowing prose) reads real scanned
+        engineering sheets far worse than PSM 11 (sparse text) — verified
+        directly against a real scanned layout plan, where PSM 11 recovered
+        SCALE/BLOCK/AREA/PLOT/FLOOR/ROAD keywords that PSM 3 missed
+        entirely. Doesn't require a real tesseract binary — just checks the
+        pipeline actually requests sparse-text mode."""
+        import plan_extractor.scanned_pdf_extractor as spe
+
+        seen_configs = []
+
+        def fake_image_to_string(image, config=""):
+            seen_configs.append(config)
+            return "SCALE 1:200 KITCHEN"
+
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+        import pytesseract
+        monkeypatch.setattr(pytesseract, "image_to_string", fake_image_to_string)
+        monkeypatch.setattr("PIL.Image.open", lambda *a, **k: object())
+
+        spe.extract_with_tesseract(b"irrelevant", page_num=0)
+
+        assert seen_configs == ["--psm 11"]
 
 
 def data_has_specific_poppler_warning(result: dict) -> bool:

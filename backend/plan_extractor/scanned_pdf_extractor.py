@@ -20,13 +20,41 @@ from plan_extractor.label_categorizer import detect_floor_labels, detect_room_la
 # Large-format architectural sheets (e.g. ARCH E-size, ~2400x1700 PDF points)
 # rasterized at a fixed 300 DPI produce ~10000x7000px images — tens of
 # megapixels that can be slow enough to time out the request or exhaust
-# Railway's memory. Capping the longest raster side keeps OCR usably sharp
-# on typical scanned pages while bounding worst-case memory/time on large
-# physical sheets, regardless of the source page's point dimensions.
-MAX_RASTER_DIMENSION_PX = 3000
+# Railway's memory. But a flat pixel cap passed to pdf2image's `size` param
+# ALWAYS resizes to that dimension — even downscaling a normal A4-ish page
+# that was never at risk, which measurably hurts OCR accuracy on already
+# low-resolution scans (verified: forcing a 3509x2480 render for an A4 page
+# down to 3000x2120 lost text pdftoppm would otherwise have rendered
+# clearly). Instead, compute an effective DPI from the page's real point
+# dimensions so only genuinely oversized sheets get scaled down.
+#
+# The cap itself must sit above ordinary scanned-sheet sizes, not just
+# "small" ones: standard architectural sheets up to A2 (1684x1191pt) need
+# ~7000px on their long side at 300 DPI — a cap of 3000 was silently
+# downscaling completely normal A4/A3/A2 scans too, which is exactly the
+# real file this was verified against. 8000px covers A2 fully at full
+# quality and only trims genuinely oversized A1/A0-and-up sheets.
+MAX_RASTER_DIMENSION_PX = 8000
+TARGET_DPI = 300
 
 
-def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) -> tuple[Optional[bytes], Optional[str]]:
+def _effective_dpi(file_bytes: bytes, page_num: int) -> int:
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            page = pdf.pages[page_num]
+            longest_pt = max(page.width, page.height)
+    except Exception:
+        return TARGET_DPI
+
+    longest_px_at_target = longest_pt / 72 * TARGET_DPI
+    if longest_px_at_target <= MAX_RASTER_DIMENSION_PX:
+        return TARGET_DPI
+    return max(72, int(MAX_RASTER_DIMENSION_PX / (longest_pt / 72)))
+
+
+def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: Optional[int] = None) -> tuple[Optional[bytes], Optional[str]]:
     """
     Rasterize a single PDF page to a PNG image using pdf2image.
     Requires poppler to be installed as a system package.
@@ -35,6 +63,9 @@ def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) ->
     diagnosable string identifying which tool failed and why — never a
     silent None on failure.
     """
+    if dpi is None:
+        dpi = _effective_dpi(file_bytes, page_num)
+
     try:
         from pdf2image import convert_from_bytes
         from pdf2image.exceptions import PDFInfoNotInstalledError
@@ -45,7 +76,6 @@ def _rasterize_pdf_page(file_bytes: bytes, page_num: int = 0, dpi: int = 300) ->
                 first_page=page_num + 1,
                 last_page=page_num + 1,
                 dpi=dpi,
-                size=MAX_RASTER_DIMENSION_PX,
                 fmt="png",
             )
         except PDFInfoNotInstalledError as e:
@@ -207,7 +237,15 @@ def extract_with_tesseract(file_bytes: bytes, page_num: int = 0) -> dict:
         import PIL.Image
 
         pil_image = PIL.Image.open(io.BytesIO(image_bytes))
-        ocr_text = pytesseract.image_to_string(pil_image)
+        # Tesseract's default page-segmentation mode assumes a single block
+        # of flowing prose. Architectural/engineering sheets are the
+        # opposite — scattered labels, tables, and dimension callouts with
+        # no reading order — and PSM 3 (default) reads noticeably worse on
+        # them than PSM 11 ("sparse text: find as much text as possible, no
+        # particular order"), verified directly against a real scanned
+        # layout plan: PSM 11 recovered SCALE/BLOCK/AREA/PLOT/FLOOR/ROAD
+        # keywords that PSM 3 missed entirely.
+        ocr_text = pytesseract.image_to_string(pil_image, config="--psm 11")
         result["raw_text"] = ocr_text
         result["success"] = True
 

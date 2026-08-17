@@ -36,22 +36,57 @@ def detect_scale(
 
     all_text = " ".join(text_labels).strip()
 
-    # ── Pattern 1: Explicit scale notation (e.g. "1:100", "SCALE 1:200") ──
+    # A single sheet legitimately carries multiple scales (e.g. a main site
+    # plan, a small-scale key/location plan, and a cross-section detail,
+    # each printed at a different scale). Picking whichever one a regex
+    # happens to match first is exactly the "confidently wrong" failure
+    # this project explicitly warns against — collect every distinct value
+    # found and only report high(er) confidence when they agree.
+    found_ratios: list[str] = []
+
+    # ── Pattern 1: Explicit ratio scale notation (e.g. "1:100", "SCALE 1:200") ──
     scale_patterns = [
         r"(?:scale|sc)\s*[=:]\s*(1\s*:\s*\d+)",
         r"(1\s*:\s*\d{2,4})\b",
         r"(?:scale|sc)\s*[=:]\s*(\d+\s*:\s*\d+)",
     ]
-
     for pat in scale_patterns:
-        m = re.search(pat, all_text, re.IGNORECASE)
-        if m:
-            scale_str = m.group(1).replace(" ", "")
-            result["value"] = scale_str
-            result["confidence"] = "amber"
-            result["source"] = "title_block_text"
-            result["note"] = f"Scale '{scale_str}' found in drawing text. Verify this matches the actual drawing."
-            break
+        for m in re.finditer(pat, all_text, re.IGNORECASE):
+            found_ratios.append(m.group(1).replace(" ", ""))
+
+    # ── Pattern 1b: Civil/site-plan scale notation (e.g. "1 CM = 2.00 MT",
+    # "SCALE 1CM=20M") — common on layout/site plans, distinct from the
+    # architectural "1:100" ratio convention above. 1cm = N metres means a
+    # 1:(N*100) ratio, since 1m = 100cm.
+    for m in re.finditer(
+        r"1\s*cm\.?\s*=\s*(\d+\.?\d*)\s*m(?:t|tr|eters?)?\b",
+        all_text, re.IGNORECASE,
+    ):
+        metres_per_cm = float(m.group(1))
+        if 0 < metres_per_cm < 1000:
+            found_ratios.append(f"1:{round(metres_per_cm * 100)}")
+
+    distinct_ratios = list(dict.fromkeys(found_ratios))  # de-dupe, keep order
+
+    if len(distinct_ratios) == 1:
+        scale_str = distinct_ratios[0]
+        result["value"] = scale_str
+        result["confidence"] = "amber"
+        result["source"] = "title_block_text"
+        result["note"] = f"Scale '{scale_str}' found in drawing text. Verify this matches the actual drawing."
+    elif len(distinct_ratios) > 1:
+        # This sheet has more than one printed scale — do NOT silently pick
+        # one. Surface all candidates and require the user to confirm which
+        # applies to the area they're measuring.
+        result["value"] = distinct_ratios[0]
+        result["confidence"] = "amber"
+        result["source"] = "title_block_text"
+        result["note"] = (
+            f"Multiple different scales found on this sheet: {', '.join(distinct_ratios)} "
+            "— likely separate sub-drawings (e.g. main plan, key plan, section detail) at "
+            f"different scales. Defaulted to '{distinct_ratios[0]}' — confirm which one "
+            "actually applies before trusting any distance/placement calculation."
+        )
 
     # ── Pattern 2: DXF header units ──
     if dxf_header_units and dxf_header_units not in ("unspecified", "unknown"):
