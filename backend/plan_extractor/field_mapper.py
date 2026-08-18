@@ -236,7 +236,7 @@ def map_to_form_fields(
             if isinstance(area, dict) and area.get("value"):
                 floor_label = "GF" if i == 0 else f"F{i}"
                 area_source = area.get("source", source_stage_prefix)
-                area_conf = "green" if area_source in ("text_label", "dxf_text", "dxf_geometry") else "amber"
+                area_conf = "green" if area_source in ("text_label", "dxf_text", "dxf_geometry", "table_native") else "amber"
                 per_floor_areas.append({
                     "floor_label": floor_label,
                     "value": area["value"],

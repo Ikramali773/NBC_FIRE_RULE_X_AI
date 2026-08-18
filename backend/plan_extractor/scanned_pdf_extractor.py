@@ -16,6 +16,11 @@ import traceback
 from typing import Optional
 
 from plan_extractor.label_categorizer import detect_floor_labels, detect_room_labels
+from plan_extractor.ingestion_log import PageIngestionLog
+from plan_extractor.ocr_engine import TesseractEngine
+from plan_extractor.ocr_retry import run_ocr_with_retry
+
+_tesseract_engine = TesseractEngine()
 
 # Large-format architectural sheets (e.g. ARCH E-size, ~2400x1700 PDF points)
 # rasterized at a fixed 300 DPI produce ~10000x7000px images — tens of
@@ -233,19 +238,37 @@ def extract_with_tesseract(file_bytes: bytes, page_num: int = 0) -> dict:
         return result
 
     try:
-        import pytesseract
         import PIL.Image
 
         pil_image = PIL.Image.open(io.BytesIO(image_bytes))
-        # Tesseract's default page-segmentation mode assumes a single block
-        # of flowing prose. Architectural/engineering sheets are the
-        # opposite — scattered labels, tables, and dimension callouts with
-        # no reading order — and PSM 3 (default) reads noticeably worse on
-        # them than PSM 11 ("sparse text: find as much text as possible, no
-        # particular order"), verified directly against a real scanned
-        # layout plan: PSM 11 recovered SCALE/BLOCK/AREA/PLOT/FLOOR/ROAD
-        # keywords that PSM 3 missed entirely.
-        ocr_text = pytesseract.image_to_string(pil_image, config="--psm 11")
+        # Preprocess (deskew/contrast) then try PSM 3 -> 6 -> 11, scoring
+        # each attempt on confidence + garbage-token ratio and stopping
+        # early once a result clears the GOOD threshold, instead of always
+        # hardcoding PSM 11. PSM 11 ("sparse text: find as much text as
+        # possible, no particular order") is still frequently the winner on
+        # architectural sheets — scattered labels/tables/callouts with no
+        # reading order read far worse under PSM 3's flowing-prose
+        # assumption — but it is not universally best, hence a ladder.
+        retry_result = run_ocr_with_retry(pil_image, _tesseract_engine)
+        ocr_text = retry_result.best.raw_text
+
+        if not retry_result.best.success:
+            result["error"] = retry_result.best.error
+            return result
+
+        PageIngestionLog(
+            document_id="",
+            page_index=page_num,
+            page_class="scanned",
+            extraction_method="ocr",
+            ocr_engine=_tesseract_engine.name,
+            ocr_config=retry_result.winning_config,
+            ocr_confidence=retry_result.best.mean_confidence,
+            ocr_retry_count=retry_result.attempt_count,
+            quality_score=retry_result.quality_score,
+            quality_label=retry_result.quality_label,
+        ).emit()
+
         result["raw_text"] = ocr_text
         result["success"] = True
 
