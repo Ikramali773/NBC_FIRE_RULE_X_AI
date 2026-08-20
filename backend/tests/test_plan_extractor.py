@@ -173,18 +173,22 @@ class TestFileRouter:
         text layer.
 
         The multi-signal page_quality classifier scores a page like this
-        (no text, real vector geometry) as PageClass.MIXED — but file_router
-        deliberately routes a MIXED page back to pure "vector" (no OCR) when
-        it also has zero embedded images: with no raster content at all,
-        there is nothing a rasterize-and-OCR pass could recover, and
-        measuring this directly against this exact real file showed OCR-ing
-        all 7 pages added ~90s to the request for zero additional extracted
-        fields. It must never fall back to "scanned" (whole-page OCR only),
-        which is what originally crashed the request."""
+        (no text, real vector geometry) as PageClass.MIXED, which routes to
+        "mixed" — both native extraction AND OCR run, merged. (An earlier
+        version of file_router skipped OCR here when there were zero
+        embedded images, reasoning there was "nothing to scan" — that was
+        wrong and has been reverted: OCR runs against a rasterized RENDER
+        of the whole page, not embedded image objects, and a direct test
+        against this exact file showed OCR recovers real content —
+        "CLIENT ROYAL LANDMARK HOTEL", real dimension figures — that native
+        extraction alone can never find here, since the file has no real
+        text objects at all.) It must never fall back to "scanned"
+        (whole-page OCR only, no native extraction attempted), which is
+        what originally crashed the request."""
         pdf_bytes = (FIXTURES / "ALL_BASIC_DRAWING.pdf").read_bytes()
         route = route_file(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
         assert route.file_type == FileType.VECTOR_PDF
-        assert all(t == "vector" for t in route.page_types)
+        assert all(t == "mixed" for t in route.page_types)
 
     def test_genuinely_scanned_photo_pdf_still_routes_to_scanned(self):
         """Same fix must not misclassify an actual scan (no text, no vector
@@ -294,10 +298,13 @@ class TestRunExtractionIntegration:
     def test_real_zero_text_cad_file_completes_without_crashing(self):
         """Regression test for the real 'Failed to fetch' production bug:
         a 7-page, zero-text-layer CAD file was being misrouted entirely to
-        OCR and never completed. It must now go down the fast vector path
-        and finish successfully, even though every field ends up red/null
-        (this specific file genuinely has no extractable text — that's an
-        honest result, not a bug)."""
+        OCR (whole-page OCR, no native extraction) and never completed. It
+        must now classify as "mixed" (native extraction AND a bounded,
+        capped OCR pass — see MAX_OCR_PAGES_PER_REQUEST) and finish
+        successfully. Most structured fields still end up red/null since
+        this file's real content (dimensions, a client name) lives in
+        prose OCR text no current regex captures into a specific field —
+        an honest gap, not a crash."""
         pdf_bytes = (FIXTURES / "ALL_BASIC_DRAWING.pdf").read_bytes()
         result = run_extraction(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
         assert result["success"] is True

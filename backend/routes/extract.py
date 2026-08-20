@@ -12,6 +12,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
 from plan_extractor.pipeline import run_extraction
+from plan_extractor.scanned_pdf_extractor import GEMINI_MODEL
 
 router = APIRouter()
 
@@ -102,6 +103,7 @@ async def extraction_health_check():
         "pdf2image": "unknown",
         "tesseract": "unknown",
         "gemini": "unconfigured",
+        "gemini_model": GEMINI_MODEL,
     }
 
     # ── Check pdfplumber ──
@@ -147,7 +149,7 @@ async def extraction_health_check():
         try:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-2.0-flash")
+            model = genai.GenerativeModel(GEMINI_MODEL)
             # Minimal text-only call — does not use vision or process any file
             response = model.generate_content(
                 "Reply with exactly: OK",

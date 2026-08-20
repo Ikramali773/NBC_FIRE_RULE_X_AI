@@ -125,22 +125,25 @@ class _FakePDFPage:
         return self._text
 
 
-class TestMixedPageOCRSkip:
-    def test_mixed_page_with_no_image_skips_ocr(self):
-        """Regression: measured directly against a real 7-page CAD export
-        (ALL_BASIC_DRAWING.pdf, zero embedded images on every page) that
-        routing MIXED pages with no raster content through OCR added ~90s
-        to the request and recovered zero additional fields — there is
-        nothing for OCR to find when there's no actual image to rasterize
-        and read. Such a page must route to "vector", not "mixed"."""
+class TestMixedPageAlwaysGetsOCR:
+    def test_mixed_page_with_no_image_still_routes_to_mixed(self):
+        """Regression: an earlier version of this code skipped OCR on a
+        MIXED page with zero embedded raster images, reasoning there was
+        "nothing to scan." That was wrong and has been reverted — OCR runs
+        against a RASTERIZED RENDER of the whole page (pdf2image/poppler),
+        not against embedded image objects, so a page with fonts flattened
+        to vector outlines still renders as legible pixel text once
+        rasterized. Verified directly against a real file (see
+        test_real_dense_cad_pages_classified_mixed / Stage 0 diagnosis):
+        OCR-ing ALL_BASIC_DRAWING.pdf's rasterized pages recovered
+        "CLIENT ROYAL LANDMARK HOTEL" and real dimension figures that
+        native pdfplumber extraction could never find on this file (it has
+        no real text objects at all). Such a page must route to "mixed",
+        not be silently downgraded to vector-only."""
         page = _FakePDFPage(text="", n_lines=300, images=[])
-        assert _classify_pdf_page(page) == "vector"
+        assert _classify_pdf_page(page) == "mixed"
 
-    def test_mixed_page_with_an_image_still_gets_ocr(self):
-        """A MIXED page that also carries a real embedded image (e.g. a
-        scanned stamp/signature on an otherwise-vector CAD sheet) has
-        actual raster content OCR could recover — it must still route to
-        "mixed", not be skipped."""
+    def test_mixed_page_with_an_image_also_routes_to_mixed(self):
         page = _FakePDFPage(text="", n_lines=300, images=[{"x0": 0, "top": 0}])
         assert _classify_pdf_page(page) == "mixed"
 
@@ -306,3 +309,120 @@ class TestIngestionLog:
             ).emit()
         assert all(r.levelno != logging.WARNING for r in caplog.records)
         assert any(r.levelno == logging.INFO for r in caplog.records)
+
+
+class TestGeminiModelConfig:
+    def test_default_model_is_not_the_decommissioned_one(self):
+        """Regression: 'gemini-2.0-flash' (this file's previous hardcoded
+        model id) was shut down by Google on 2026-06-01 — every Gemini call
+        this pipeline made would have failed on every request, silently
+        falling through to Tesseract even with a valid API key configured.
+        This just guards against ever hardcoding that exact dead id again."""
+        import plan_extractor.scanned_pdf_extractor as spe
+        assert spe.GEMINI_MODEL != "gemini-2.0-flash"
+        assert spe.GEMINI_MODEL
+
+    def test_model_is_configurable_via_env_var(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_MODEL", "gemini-3.5-flash")
+        import importlib
+        import plan_extractor.scanned_pdf_extractor as spe
+        importlib.reload(spe)
+        try:
+            assert spe.GEMINI_MODEL == "gemini-3.5-flash"
+        finally:
+            monkeypatch.delenv("GEMINI_MODEL", raising=False)
+            importlib.reload(spe)
+
+
+class TestProjectNameFromOCR:
+    def test_recovers_client_name_stopping_at_next_label(self):
+        """Regression: verified directly against a real file
+        (ALL_BASIC_DRAWING.pdf) whose flat (no-newline) OCR text reads
+        "...CLIENT ROYAL LANDMARK HOTEL PROJECT DWG NO DATE..." — there is
+        no punctuation Tesseract preserved to bound the name, so this must
+        stop at the next label-like word ("PROJECT") instead."""
+        from plan_extractor.scanned_pdf_extractor import _extract_project_name_from_ocr
+        text = "ONLY FOR REFERENCE CLIENT ROYAL LANDMARK HOTEL PROJECT DWG NO DATE NORTH"
+        assert _extract_project_name_from_ocr(text) == "ROYAL LANDMARK HOTEL"
+
+    def test_does_not_false_positive_on_boilerplate_owner_mention(self):
+        """Regression: a real file's legal boilerplate reads "...DEVELOPER,
+        OWNER FROM THEIR RESPONSIBILITIES, IMPOSED UNDER THE ACT..." — an
+        earlier draft of this matcher included a bare "owner" keyword and
+        would have captured "FROM THEIR RESPONSIBILITIES..." as a project
+        name. Only "CLIENT"/"PROJECT NAME"/"BUILDING NAME" trigger a match."""
+        from plan_extractor.scanned_pdf_extractor import _extract_project_name_from_ocr
+        text = "SHALL NOT DISCHARGE THE OWNER FROM THEIR RESPONSIBILITIES IMPOSED UNDER THE ACT"
+        assert _extract_project_name_from_ocr(text) is None
+
+    def test_no_match_returns_none(self):
+        from plan_extractor.scanned_pdf_extractor import _extract_project_name_from_ocr
+        assert _extract_project_name_from_ocr("SCALE 1:100 GROUND FLOOR PLAN") is None
+
+
+class TestGeminiFallbackReasonCategorization:
+    def test_deprecated_model_error_is_labeled_specifically(self, monkeypatch):
+        """Regression: this pipeline's Gemini model id was, in fact, dead
+        (see TestGeminiModelConfig) — every call would have raised a "model
+        not found"-style error. Before this fix that fell into a generic
+        "Gemini API error" bucket; it now names the real, actionable cause
+        so a deployer doesn't have to guess from a raw exception string."""
+        import plan_extractor.scanned_pdf_extractor as spe
+
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+
+        class _FakeModel:
+            def __init__(self, *a, **k):
+                pass
+
+            def generate_content(self, *a, **k):
+                raise Exception("404 model not found: models/gemini-2.0-flash is not supported")
+
+        class _FakeGenAI:
+            GenerationConfig = lambda *a, **k: None
+
+            @staticmethod
+            def configure(**k):
+                pass
+
+            GenerativeModel = _FakeModel
+
+        import sys
+        monkeypatch.setitem(sys.modules, "google.generativeai", _FakeGenAI)
+        monkeypatch.setattr("PIL.Image.open", lambda *a, **k: object())
+
+        result = spe.extract_with_gemini(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "not found/deprecated" in result["error"]
+        assert "GEMINI_MODEL" in result["error"]
+
+    def test_rate_limit_error_still_labeled_as_rate_limit(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+
+        monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+
+        class _FakeModel:
+            def __init__(self, *a, **k):
+                pass
+
+            def generate_content(self, *a, **k):
+                raise Exception("429 Resource exhausted: quota exceeded")
+
+        class _FakeGenAI:
+            GenerationConfig = lambda *a, **k: None
+
+            @staticmethod
+            def configure(**k):
+                pass
+
+            GenerativeModel = _FakeModel
+
+        import sys
+        monkeypatch.setitem(sys.modules, "google.generativeai", _FakeGenAI)
+        monkeypatch.setattr("PIL.Image.open", lambda *a, **k: object())
+
+        result = spe.extract_with_gemini(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "rate limit/quota exceeded" in result["error"]

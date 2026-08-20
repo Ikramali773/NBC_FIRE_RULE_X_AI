@@ -14,7 +14,7 @@ from typing import Optional
 
 import pdfplumber
 
-from plan_extractor.page_quality import PageClass, PAGE_CLASS_TO_ROUTE, classify_page
+from plan_extractor.page_quality import PAGE_CLASS_TO_ROUTE, classify_page
 
 
 class FileType(str, Enum):
@@ -64,18 +64,21 @@ def _classify_pdf_page(page) -> str:
     (text length, garbage-char ratio, vector-path density, image count)
     rather than a single character-count threshold.
 
-    Exception: a page reaching PageClass.MIXED purely through vector-path
-    density (no text, no embedded image at all — a CAD sheet with fonts
-    flattened to outlined paths) has nothing OCR could ever recover; OCR
-    reads a rasterized render of the page, and pure vector line art with
-    zero raster image content is not a scan of anything. Measured directly
-    against a real 7-page CAD export: routing those pages through OCR too
-    added ~90s to the request and recovered zero additional fields. Only
-    route to OCR when there's an actual embedded image to read.
+    NOTE: an earlier version of this function skipped OCR on a MIXED page
+    when it had zero embedded raster images, reasoning that "nothing was
+    scanned, so there's nothing to read." That reasoning was wrong and has
+    been reverted: OCR runs against a RASTERIZED RENDER of the whole page
+    (via pdf2image/poppler), not against embedded image objects — a page
+    with fonts flattened to vector outlines still renders as legible pixel
+    text once rasterized. Verified directly against ALL_BASIC_DRAWING.pdf
+    (zero embedded images, zero real text objects): OCR-ing its rasterized
+    render recovered "CLIENT ROYAL LANDMARK HOTEL", real dimension figures,
+    and construction notes — none of which native pdfplumber extraction
+    could ever find on this file, since there is no real text layer at
+    all. Skipping OCR here was silently zeroing out the only path capable
+    of reading this file's content.
     """
-    page_class, signals = classify_page(page)
-    if page_class == PageClass.MIXED and signals.image_count == 0:
-        return "vector"
+    page_class, _signals = classify_page(page)
     return PAGE_CLASS_TO_ROUTE[page_class]
 
 

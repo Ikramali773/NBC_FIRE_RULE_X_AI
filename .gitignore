@@ -76,6 +76,7 @@ ts_errors.txt
 .env
 .env.*
 *.env
+!.env.example
 credentials.json
 *.key
 .credentials
