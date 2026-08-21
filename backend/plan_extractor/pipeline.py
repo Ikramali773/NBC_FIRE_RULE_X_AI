@@ -131,8 +131,13 @@ def run_extraction(file_bytes: bytes, filename: str) -> dict:
         # correctly instead of forcing the whole document down one path.
         if file_type in (FileType.VECTOR_PDF, FileType.SCANNED_PDF):
             page_types = route.page_types or []
-            vector_pages = {i for i, t in enumerate(page_types) if t == "vector"}
-            scanned_pages = [i for i, t in enumerate(page_types) if t == "scanned"]
+            # "mixed" pages (no trustworthy text layer alone, but real vector
+            # geometry or garbage-dominated text) go through BOTH paths —
+            # neither native extraction nor OCR alone is guaranteed
+            # sufficient — and _merge_pdf_extraction below combines them
+            # (vector/text values win when present, OCR only fills gaps).
+            vector_pages = {i for i, t in enumerate(page_types) if t in ("vector", "mixed")}
+            scanned_pages = [i for i, t in enumerate(page_types) if t in ("scanned", "mixed")]
 
             # OCR is expensive (rasterize + Tesseract, optionally Gemini) —
             # cap how many pages a single request will run it on so a large

@@ -170,11 +170,25 @@ class TestFileRouter:
         every page to OCR — rasterizing 7 large-format sheets at once was
         slow/memory-heavy enough to crash the request ("Failed to fetch" in
         the browser). Real structural vector geometry must win over an empty
-        text layer."""
+        text layer.
+
+        The multi-signal page_quality classifier scores a page like this
+        (no text, real vector geometry) as PageClass.MIXED, which routes to
+        "mixed" — both native extraction AND OCR run, merged. (An earlier
+        version of file_router skipped OCR here when there were zero
+        embedded images, reasoning there was "nothing to scan" — that was
+        wrong and has been reverted: OCR runs against a rasterized RENDER
+        of the whole page, not embedded image objects, and a direct test
+        against this exact file showed OCR recovers real content —
+        "CLIENT ROYAL LANDMARK HOTEL", real dimension figures — that native
+        extraction alone can never find here, since the file has no real
+        text objects at all.) It must never fall back to "scanned"
+        (whole-page OCR only, no native extraction attempted), which is
+        what originally crashed the request."""
         pdf_bytes = (FIXTURES / "ALL_BASIC_DRAWING.pdf").read_bytes()
         route = route_file(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
         assert route.file_type == FileType.VECTOR_PDF
-        assert all(t == "vector" for t in route.page_types)
+        assert all(t == "mixed" for t in route.page_types)
 
     def test_genuinely_scanned_photo_pdf_still_routes_to_scanned(self):
         """Same fix must not misclassify an actual scan (no text, no vector
@@ -284,39 +298,67 @@ class TestRunExtractionIntegration:
     def test_real_zero_text_cad_file_completes_without_crashing(self):
         """Regression test for the real 'Failed to fetch' production bug:
         a 7-page, zero-text-layer CAD file was being misrouted entirely to
-        OCR and never completed. It must now go down the fast vector path
-        and finish successfully, even though every field ends up red/null
-        (this specific file genuinely has no extractable text — that's an
-        honest result, not a bug)."""
+        OCR (whole-page OCR, no native extraction) and never completed. It
+        must now classify as "mixed" (native extraction AND a bounded,
+        capped OCR pass — see MAX_OCR_PAGES_PER_REQUEST) and finish
+        successfully. Most structured fields still end up red/null since
+        this file's real content (dimensions, a client name) lives in
+        prose OCR text no current regex captures into a specific field —
+        an honest gap, not a crash."""
         pdf_bytes = (FIXTURES / "ALL_BASIC_DRAWING.pdf").read_bytes()
         result = run_extraction(pdf_bytes, "ALL_BASIC_DRAWING.pdf")
         assert result["success"] is True
         assert result["data"]["_extraction_quality"]["total_fields"] > 0
 
-    def test_tesseract_uses_sparse_text_mode_not_default(self, monkeypatch):
+    def test_tesseract_tries_and_can_pick_sparse_text_mode(self, monkeypatch):
         """Regression test for a real quality bug: Tesseract's default page-
         segmentation mode (PSM 3, assumes flowing prose) reads real scanned
         engineering sheets far worse than PSM 11 (sparse text) — verified
         directly against a real scanned layout plan, where PSM 11 recovered
         SCALE/BLOCK/AREA/PLOT/FLOOR/ROAD keywords that PSM 3 missed
-        entirely. Doesn't require a real tesseract binary — just checks the
-        pipeline actually requests sparse-text mode."""
+        entirely.
+
+        The pipeline no longer hardcodes one PSM mode — it now runs a
+        quality-scored retry ladder (PSM 3 -> 6 -> 11, see ocr_retry.py) and
+        picks the best-scoring attempt. This test simulates that same real
+        finding (PSM 11 recovers real words, PSM 3/6 don't) at the
+        pytesseract.image_to_data layer and confirms the ladder both tries
+        sparse-text mode and is capable of selecting it. Doesn't require a
+        real tesseract binary."""
         import plan_extractor.scanned_pdf_extractor as spe
+        import PIL.Image
 
         seen_configs = []
 
-        def fake_image_to_string(image, config=""):
+        def _fake_data(words: list[str], confidence: float) -> dict:
+            n = len(words)
+            return {
+                "text": words,
+                "conf": [confidence] * n,
+                "left": [0] * n,
+                "top": [0] * n,
+                "width": [10] * n,
+                "height": [10] * n,
+            }
+
+        def fake_image_to_data(image, config="", output_type=None):
             seen_configs.append(config)
-            return "SCALE 1:200 KITCHEN"
+            if config == "--psm 11":
+                return _fake_data(["SCALE", "1:200", "KITCHEN"], confidence=85.0)
+            return _fake_data(["x"], confidence=5.0)
+
+        fake_image = PIL.Image.new("RGB", (20, 20), "white")
 
         monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
         import pytesseract
-        monkeypatch.setattr(pytesseract, "image_to_string", fake_image_to_string)
-        monkeypatch.setattr("PIL.Image.open", lambda *a, **k: object())
+        monkeypatch.setattr(pytesseract, "image_to_data", fake_image_to_data)
+        monkeypatch.setattr("PIL.Image.open", lambda *a, **k: fake_image)
 
-        spe.extract_with_tesseract(b"irrelevant", page_num=0)
+        result = spe.extract_with_tesseract(b"irrelevant", page_num=0)
 
-        assert seen_configs == ["--psm 11"]
+        assert "--psm 11" in seen_configs
+        assert result["success"] is True
+        assert "SCALE" in result["raw_text"]
 
 
 def data_has_specific_poppler_warning(result: dict) -> bool:

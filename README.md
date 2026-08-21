@@ -37,8 +37,20 @@ The pipeline uses Google's Gemini Vision API as an enhanced fallback for scanned
    ```env
    GEMINI_API_KEY=your-key-here
    ```
+3. (Optional) Override the model via `GEMINI_MODEL` if the default needs to change:
+   ```env
+   GEMINI_MODEL=gemini-2.5-flash
+   ```
+   Google periodically retires Gemini model ids — `gemini-2.5-flash` is confirmed active as of 2026-08 but Google
+   has announced its retirement for 2026-10-16. If Gemini calls start failing with a "not found"/"deprecated"
+   error (visible in the `/api/extract/health-check` response and in extraction warnings), check
+   [the current model list](https://ai.google.dev/gemini-api/docs/models) and update this value — no code change
+   needed.
 
-*Note: If no key is provided, the system will gracefully fall back to using local Tesseract OCR for scanned PDFs.*
+*Note: If no key is provided, the system will gracefully fall back to using local Tesseract OCR for scanned PDFs.
+Gemini is only ever used for pages with no real text layer — pages pdfplumber can already read directly never
+go through this fallback chain at all, and Gemini-sourced values are always capped at amber confidence, never
+green, since they are a single-source AI read of an image rather than an extracted value.*
 
 ### Health Check
 

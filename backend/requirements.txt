@@ -93,6 +93,7 @@ scipy>=1.11.0
 scikit-image>=0.22.0
 networkx>=3.2
 ezdxf>=0.19.0
+opencv-python-headless>=4.8.0
 pyparsing==3.3.2
 pytest==9.1.1
 pytest-xdist==3.8.0

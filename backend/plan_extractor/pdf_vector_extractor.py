@@ -13,7 +13,12 @@ from typing import Optional
 
 import pdfplumber
 
-from plan_extractor.label_categorizer import detect_floor_labels, detect_room_labels
+from plan_extractor.label_categorizer import (
+    FLOOR_LABEL_PATTERNS,
+    detect_floor_labels,
+    detect_room_labels,
+)
+from plan_extractor.table_extractor import extract_tables
 
 
 def _shoelace_area(points: list[tuple[float, float]]) -> float:
@@ -206,6 +211,72 @@ def _detect_areas(all_text: str) -> list[dict]:
     return areas
 
 
+_TABLE_AREA_HEADER_RE = re.compile(r"AREA", re.IGNORECASE)
+_TABLE_SQM_HEADER_RE = re.compile(r"SQ\.?\s*M|SQM|M\s*2\b|M²", re.IGNORECASE)
+_TABLE_FLOOR_HEADER_RE = re.compile(r"FLOOR|STOREY|STORY|LEVEL", re.IGNORECASE)
+
+
+def _table_looks_like_floor_area_table(rows: list[list[str]]) -> bool:
+    """
+    A quality-passing table (table_extractor already rejected the noisy
+    line-intersection false positives) still isn't necessarily a *floor*
+    area table — a real plot/survey-number area table was found on the same
+    real page as a genuine floor-area table would appear on, and matching
+    "AREA" alone would misread it as one. Require both an area/sqm header
+    AND a floor/level header before treating a table as floor-wise areas.
+    """
+    if not rows:
+        return False
+    header_text = " ".join(c or "" for c in rows[0])
+    has_area = bool(_TABLE_AREA_HEADER_RE.search(header_text) and _TABLE_SQM_HEADER_RE.search(header_text))
+    has_floor = bool(_TABLE_FLOOR_HEADER_RE.search(header_text)) or any(
+        re.search(pat, header_text, re.IGNORECASE) for pat in FLOOR_LABEL_PATTERNS
+    )
+    return has_area and has_floor
+
+
+def _extract_floor_areas_from_table(table) -> list[dict]:
+    """Pull (floor_label, area_value) pairs out of a table already
+    confirmed to look like a floor-area table. Each data row must name a
+    floor/level in some cell and carry a plausible area number in another —
+    rows missing either are skipped rather than guessed at."""
+    if not _table_looks_like_floor_area_table(table.rows):
+        return []
+
+    results = []
+    for row in table.rows[1:]:
+        cells = [c or "" for c in row]
+        row_text = " ".join(cells)
+
+        floor_label = None
+        for pat in FLOOR_LABEL_PATTERNS:
+            m = re.search(pat, row_text, re.IGNORECASE)
+            if m:
+                floor_label = re.sub(r"\s+", " ", m.group(0).strip().upper())
+                break
+        if not floor_label:
+            continue
+
+        area_val = None
+        for cell in cells:
+            m = re.search(r"(\d+\.?\d*)", cell)
+            if m:
+                val = float(m.group(1))
+                if 5.0 <= val <= 100000.0:
+                    area_val = val
+                    break
+        if area_val is None:
+            continue
+
+        results.append({
+            "value": area_val,
+            "label": floor_label,
+            "source": "table_native",
+            "raw": row_text.replace("\n", " ")[:200],
+        })
+    return results
+
+
 def _detect_occupancy_hints(all_text: str) -> Optional[dict]:
     """Try to detect occupancy type from text keywords."""
     keyword_map = {
@@ -346,7 +417,10 @@ def extract_from_vector_pdf(file_bytes: bytes, only_pages: Optional[set] = None)
         "floor_labels": [],
         "room_labels": [],
         "warnings": [],
+        "tables": [],
     }
+
+    table_derived_areas: list[dict] = []
 
     try:
         pdf_io = io.BytesIO(file_bytes)
@@ -421,6 +495,22 @@ def extract_from_vector_pdf(file_bytes: bytes, only_pages: Optional[set] = None)
                         f"Page {page_idx}: geometry extraction error: {str(e)}"
                     )
 
+                # ── Structured tables (quality-filtered, see table_extractor) ──
+                try:
+                    page_tables = extract_tables(page, page_index=page_idx)
+                    for t in page_tables:
+                        result["tables"].append({
+                            "page": page_idx,
+                            "bbox": t.bbox,
+                            "fill_ratio": t.fill_ratio,
+                            "markdown": t.to_markdown(),
+                        })
+                        table_derived_areas.extend(_extract_floor_areas_from_table(t))
+                except Exception as e:
+                    result["warnings"].append(
+                        f"Page {page_idx}: table extraction error: {str(e)}"
+                    )
+
             # ── Combine all text for analysis ──
             all_text = "\n".join(all_text_parts)
             result["raw_text_labels"] = [
@@ -435,7 +525,11 @@ def extract_from_vector_pdf(file_bytes: bytes, only_pages: Optional[set] = None)
 
             result["height"] = _detect_height(all_text, result["dimension_values"])
             result["floors"] = _detect_floor_count(all_text)
-            result["areas"] = _detect_areas(all_text)
+            # A clean, quality-filtered floor-area table beats the flat
+            # regex fallback — it carries real row/column structure instead
+            # of guessing from proximity in a flattened text stream. The
+            # regex path only runs when no such table was found.
+            result["areas"] = table_derived_areas if table_derived_areas else _detect_areas(all_text)
             result["occupancy_hint"] = _detect_occupancy_hints(all_text)
             result["construction_type"] = _detect_construction_type(all_text)
             result["basement"] = _detect_basement(all_text)

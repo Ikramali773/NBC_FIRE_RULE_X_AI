@@ -207,6 +207,44 @@ export interface NBCSApplicabilityData {
     clauseRef: string;
 }
 
+export interface PlacementPoint {
+    index: number;
+    xPt: number;
+    yPt: number;
+    isJunction: boolean;
+    locationDescription: string;
+    clauseRef: string;
+}
+
+export interface PlacementScale {
+    mm_per_pt: number | null;
+    confidence: 'green' | 'amber' | 'red';
+    sample_count: number;
+    rejected_samples: number;
+    note: string;
+    editable: boolean;
+}
+
+export interface PlacementFloorResult {
+    floorIndex: number;
+    floorLabel: string;
+    pageIndex: number;
+    pageWidthPt: number;
+    pageHeightPt: number;
+    hazardType: string;
+    rating: string;
+    maxAreaM2: number;
+    coverageRadiusM: number;
+    scale: PlacementScale;
+    points: PlacementPoint[];
+    warnings: string[];
+}
+
+export interface PlacementSuggestFloorsResponse {
+    floors: PlacementFloorResult[];
+    warnings: string[];
+}
+
 export interface NBCSOccupantLoadData {
     note: string;
     totalOccupants: number;

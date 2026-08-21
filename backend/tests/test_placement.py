@@ -126,3 +126,48 @@ class TestPlacementRoute:
             data={"page_index": "0", "hazard_type": "moderate"},
         )
         assert resp.status_code == 400
+
+
+class TestSuggestFloorsRoute:
+    def test_end_to_end_real_measured_behavior(self):
+        """Regression test asserting the REAL, measured outcome against
+        this fixture, not the hoped-for "every floor works" outcome: only
+        pages 0 (Ground Floor) and 2 (Second Floor) actually calibrate a
+        scale today — pages 1/3/4 fail scale calibration (a pre-existing,
+        separate limitation of scale_calibration.py, not something this
+        endpoint fixes) and must be skipped with a clear per-floor reason
+        rather than aborting the whole request."""
+        app = FastAPI()
+        app.include_router(placement_router)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/api/placement/suggest-floors",
+            files={"file": ("KASTURBA_GANDHI.pdf", PDF_BYTES, "application/pdf")},
+            data={"hazard_type": "moderate"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+
+        floor_labels = [f["floorLabel"] for f in data["floors"]]
+        assert floor_labels == ["GROUND FLOOR", "SECOND FLOOR"]
+        for floor in data["floors"]:
+            assert floor["points"], f"expected points for {floor['floorLabel']}"
+            assert floor["scale"]["mm_per_pt"] is not None
+
+        assert len(data["warnings"]) == 3
+        assert any("FIRST FLOOR" in w for w in data["warnings"])
+        assert any("THIRD FLOOR" in w for w in data["warnings"])
+        assert any("TERRACE" in w for w in data["warnings"])
+
+    def test_rejects_non_pdf(self):
+        app = FastAPI()
+        app.include_router(placement_router)
+        client = TestClient(app)
+
+        resp = client.post(
+            "/api/placement/suggest-floors",
+            files={"file": ("plan.dwg", b"not a pdf", "application/octet-stream")},
+            data={"hazard_type": "moderate"},
+        )
+        assert resp.status_code == 400

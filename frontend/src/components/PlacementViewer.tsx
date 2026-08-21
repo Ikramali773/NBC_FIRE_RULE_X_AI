@@ -12,41 +12,18 @@
 // separate coordinate-flip needed, as long as the canvas is rendered at a
 // known scale from the same page dimensions returned by the API.
 //
+// Multi-floor: the backend auto-detects every floor page in the uploaded
+// file (POST /api/placement/suggest-floors) and returns one result per
+// floor that could be placed — a floor whose scale can't be calibrated is
+// skipped there with a specific reason, surfaced below as a warning rather
+// than hidden. The floor-tab row lets the user switch which floor's canvas
+// + table is shown; only ONE floor's PDF page is ever rendered at a time.
+//
 // No pipe-routing lines, no other equipment types, no styled export — this
 // is an in-app overlay only, per Phase 3a's stated scope.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-
-interface PlacementPoint {
-    index: number;
-    xPt: number;
-    yPt: number;
-    isJunction: boolean;
-    locationDescription: string;
-    clauseRef: string;
-}
-
-interface ScaleCalibration {
-    mm_per_pt: number | null;
-    confidence: 'green' | 'amber' | 'red';
-    sample_count: number;
-    rejected_samples: number;
-    note: string;
-    editable: boolean;
-}
-
-interface PlacementResponse {
-    pageIndex: number;
-    pageWidthPt: number;
-    pageHeightPt: number;
-    hazardType: string;
-    rating: string;
-    maxAreaM2: number;
-    coverageRadiusM: number;
-    scale: ScaleCalibration;
-    points: PlacementPoint[];
-    warnings: string[];
-}
+import type { PlacementFloorResult, PlacementSuggestFloorsResponse } from '@/types';
 
 const CONF_COLORS: Record<string, { bg: string; border: string; text: string }> = {
     green: { bg: '#E8F5E9', border: '#4CAF50', text: '#2E7D32' },
@@ -57,11 +34,15 @@ const CONF_COLORS: Record<string, { bg: string; border: string; text: string }> 
 export default function PlacementViewer({ hazardType, onClose }: { hazardType: string; onClose: () => void }) {
     const [step, setStep] = useState<'upload' | 'processing' | 'result' | 'error'>('upload');
     const [error, setError] = useState('');
-    const [result, setResult] = useState<PlacementResponse | null>(null);
+    const [floors, setFloors] = useState<PlacementFloorResult[]>([]);
+    const [skippedFloorWarnings, setSkippedFloorWarnings] = useState<string[]>([]);
+    const [activeTab, setActiveTab] = useState(0);
     const [manualMmPerPt, setManualMmPerPt] = useState<string>('');
     const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
+
+    const activeFloor = floors[activeTab] ?? null;
 
     const runSuggestion = useCallback(async (file: File) => {
         setStep('processing');
@@ -75,20 +56,26 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
 
             const formData = new FormData();
             formData.append('file', file);
-            formData.append('page_index', '0');
             formData.append('hazard_type', hazardType);
 
-            const res = await fetch(`${API_URL}/api/placement/suggest`, {
+            const res = await fetch(`${API_URL}/api/placement/suggest-floors`, {
                 method: 'POST',
                 body: formData,
-                signal: AbortSignal.timeout(120000),
+                // Every floor page now runs the full geometry/scale chain
+                // sequentially server-side (the old single-page endpoint's
+                // 120s budget assumed one page) — a real 5-floor file can
+                // genuinely take several minutes.
+                signal: AbortSignal.timeout(360000),
             });
-            const data = await res.json();
+            const data: PlacementSuggestFloorsResponse & { error?: string } = await res.json();
             if (!res.ok) {
                 throw new Error(data.error || 'Placement suggestion failed.');
             }
-            setResult(data);
-            setManualMmPerPt(data.scale?.mm_per_pt ? String(Math.round(data.scale.mm_per_pt * 100) / 100) : '');
+            setFloors(data.floors);
+            setSkippedFloorWarnings(data.warnings || []);
+            setActiveTab(0);
+            const firstScale = data.floors[0]?.scale?.mm_per_pt;
+            setManualMmPerPt(firstScale ? String(Math.round(firstScale * 100) / 100) : '');
             setStep('result');
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Placement suggestion failed.');
@@ -105,9 +92,17 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
         runSuggestion(f);
     }, [runSuggestion]);
 
-    // Render the PDF page + dot overlay once we have both the file bytes and result.
+    // Switching floor tabs re-syncs the editable scale field to the newly
+    // active floor's own calibration, so it never shows a stale value from
+    // whichever floor was previously selected.
     useEffect(() => {
-        if (!pdfBytes || !result || step !== 'result' || !canvasRef.current) return;
+        const mm = activeFloor?.scale?.mm_per_pt;
+        setManualMmPerPt(mm ? String(Math.round(mm * 100) / 100) : '');
+    }, [activeTab, activeFloor]);
+
+    // Render the PDF page + dot overlay for the currently active floor.
+    useEffect(() => {
+        if (!pdfBytes || !activeFloor || step !== 'result' || !canvasRef.current) return;
         let cancelled = false;
 
         (async () => {
@@ -118,10 +113,10 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
             ).toString();
 
             const doc = await pdfjsLib.getDocument({ data: pdfBytes.slice() }).promise;
-            const page = await doc.getPage(result.pageIndex + 1);
+            const page = await doc.getPage(activeFloor.pageIndex + 1);
 
             const targetWidthPx = 900;
-            const scale = targetWidthPx / result.pageWidthPt;
+            const scale = targetWidthPx / activeFloor.pageWidthPt;
             const viewport = page.getViewport({ scale });
 
             const canvas = canvasRef.current;
@@ -136,7 +131,7 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
 
             // Dot overlay — same linear scale as the canvas render, since
             // xPt/yPt are already top-down like the canvas's own y-axis.
-            result.points.forEach((p) => {
+            activeFloor.points.forEach((p) => {
                 const x = p.xPt * scale;
                 const y = p.yPt * scale;
                 ctx.beginPath();
@@ -155,9 +150,9 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
         })();
 
         return () => { cancelled = true; };
-    }, [pdfBytes, result, step]);
+    }, [pdfBytes, activeFloor, step]);
 
-    const scaleConf = result?.scale.confidence || 'red';
+    const scaleConf = activeFloor?.scale.confidence || 'red';
     const colors = CONF_COLORS[scaleConf];
 
     return (
@@ -199,7 +194,7 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
                             />
                             <div className="text-5xl opacity-60 mb-4">📐</div>
                             <p className="text-lg font-semibold text-slate-600">Drop a vector PDF floor plan here</p>
-                            <p className="text-sm text-slate-400 mt-1">or click to browse · PDF only · ground floor / first page analyzed</p>
+                            <p className="text-sm text-slate-400 mt-1">or click to browse · PDF only · every floor page in the file is detected and analyzed</p>
                         </div>
                         <p className="text-xs text-slate-400 mt-4 leading-relaxed">
                             This feature needs a CAD-drawn file with real vector line data — scanned or photographed
@@ -228,67 +223,96 @@ export default function PlacementViewer({ hazardType, onClose }: { hazardType: s
                     </div>
                 )}
 
-                {step === 'result' && result && (
-                    <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px]">
-                        <div className="p-4 border-r border-slate-100 overflow-auto max-h-[75vh] flex justify-center bg-slate-50">
-                            <canvas ref={canvasRef} className="border border-slate-300 bg-white shadow-sm" data-testid="placement-canvas" />
-                        </div>
+                {step === 'result' && activeFloor && (
+                    <div>
+                        {floors.length > 1 && (
+                            <div className="flex flex-wrap gap-1.5 px-4 pt-4 border-b border-slate-100 pb-3" data-testid="floor-tabs">
+                                {floors.map((f, i) => (
+                                    <button
+                                        key={`${f.floorLabel}-${f.pageIndex}`}
+                                        onClick={() => setActiveTab(i)}
+                                        className={`px-3 py-1.5 text-xs font-bold uppercase tracking-wide border ${
+                                            i === activeTab
+                                                ? 'bg-[#0A192F] text-white border-[#0A192F]'
+                                                : 'bg-white text-slate-600 border-slate-300 hover:border-slate-400'
+                                        }`}
+                                        data-testid={`floor-tab-${i}`}
+                                    >
+                                        {f.floorLabel}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
 
-                        <div className="p-4 max-h-[75vh] overflow-auto space-y-4">
-                            <div
-                                className="px-3 py-2.5 text-xs"
-                                style={{ backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}` }}
-                            >
-                                <p className="font-bold uppercase tracking-wider text-[10px] mb-1" style={{ color: colors.text }}>
-                                    Drawing Scale — {scaleConf === 'green' ? 'High confidence' : scaleConf === 'amber' ? 'Verify' : 'Not detected'}
-                                </p>
-                                <div className="flex items-center gap-2">
-                                    <input
-                                        type="number"
-                                        step="0.01"
-                                        value={manualMmPerPt}
-                                        onChange={(e) => setManualMmPerPt(e.target.value)}
-                                        className="w-24 px-2 py-1 border border-slate-300 text-sm font-mono"
-                                        data-testid="scale-mm-per-pt"
-                                    />
-                                    <span className="text-slate-500">mm / pt</span>
-                                </div>
-                                <p className="text-[11px] text-slate-500 mt-1 leading-snug">{result.scale.note}</p>
+                        {skippedFloorWarnings.length > 0 && (
+                            <div className="mx-4 mt-3 px-3 py-2 bg-amber-50 border border-amber-200 text-[11px] text-amber-700 space-y-1">
+                                <p className="font-bold uppercase tracking-wider text-[10px]">Some floors were skipped</p>
+                                {skippedFloorWarnings.map((w, i) => <p key={i}>• {w}</p>)}
+                            </div>
+                        )}
+
+                        <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px]">
+                            <div className="p-4 border-r border-slate-100 overflow-auto max-h-[75vh] flex justify-center bg-slate-50">
+                                <canvas ref={canvasRef} className="border border-slate-300 bg-white shadow-sm" data-testid="placement-canvas" />
                             </div>
 
-                            <div className="text-xs text-slate-600 space-y-1 border-b border-slate-100 pb-3">
-                                <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Hazard</span>{result.hazardType} → {result.rating}, max {result.maxAreaM2} m²/extinguisher</p>
-                                <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Coverage radius</span>{result.coverageRadiusM} m</p>
-                                <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Suggested points</span>{result.points.length}</p>
-                            </div>
-
-                            {result.warnings.length > 0 && (
-                                <div className="px-3 py-2 bg-amber-50 border border-amber-200 text-[11px] text-amber-700 space-y-1">
-                                    {result.warnings.map((w, i) => <p key={i}>• {w}</p>)}
+                            <div className="p-4 max-h-[75vh] overflow-auto space-y-4">
+                                <div
+                                    className="px-3 py-2.5 text-xs"
+                                    style={{ backgroundColor: colors.bg, borderLeft: `3px solid ${colors.border}` }}
+                                >
+                                    <p className="font-bold uppercase tracking-wider text-[10px] mb-1" style={{ color: colors.text }}>
+                                        Drawing Scale — {scaleConf === 'green' ? 'High confidence' : scaleConf === 'amber' ? 'Verify' : 'Not detected'}
+                                    </p>
+                                    <div className="flex items-center gap-2">
+                                        <input
+                                            type="number"
+                                            step="0.01"
+                                            value={manualMmPerPt}
+                                            onChange={(e) => setManualMmPerPt(e.target.value)}
+                                            className="w-24 px-2 py-1 border border-slate-300 text-sm font-mono"
+                                            data-testid="scale-mm-per-pt"
+                                        />
+                                        <span className="text-slate-500">mm / pt</span>
+                                    </div>
+                                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">{activeFloor.scale.note}</p>
                                 </div>
-                            )}
 
-                            <div>
-                                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] mb-2">Suggested Locations</p>
-                                <div className="space-y-1.5" data-testid="placement-table">
-                                    {result.points.map((p) => (
-                                        <div key={p.index} className="flex items-start gap-2 text-xs border-b border-slate-100 pb-1.5">
-                                            <span className="w-5 h-5 shrink-0 rounded-full bg-[#D50000] text-white text-[10px] font-bold flex items-center justify-center">{p.index}</span>
-                                            <div className="min-w-0">
-                                                <p className="text-slate-800 truncate">{p.locationDescription}{p.isJunction ? ' · corridor junction' : ''}</p>
-                                                <p className="text-[10px] text-slate-400 font-mono">{p.clauseRef}</p>
+                                <div className="text-xs text-slate-600 space-y-1 border-b border-slate-100 pb-3">
+                                    <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Floor</span>{activeFloor.floorLabel}</p>
+                                    <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Hazard</span>{activeFloor.hazardType} → {activeFloor.rating}, max {activeFloor.maxAreaM2} m²/extinguisher</p>
+                                    <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Coverage radius</span>{activeFloor.coverageRadiusM} m</p>
+                                    <p><span className="font-bold text-slate-400 uppercase tracking-wider text-[10px] mr-2">Suggested points</span>{activeFloor.points.length}</p>
+                                </div>
+
+                                {activeFloor.warnings.length > 0 && (
+                                    <div className="px-3 py-2 bg-amber-50 border border-amber-200 text-[11px] text-amber-700 space-y-1">
+                                        {activeFloor.warnings.map((w, i) => <p key={i}>• {w}</p>)}
+                                    </div>
+                                )}
+
+                                <div>
+                                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] mb-2">Suggested Locations</p>
+                                    <div className="space-y-1.5" data-testid="placement-table">
+                                        {activeFloor.points.map((p) => (
+                                            <div key={p.index} className="flex items-start gap-2 text-xs border-b border-slate-100 pb-1.5">
+                                                <span className="w-5 h-5 shrink-0 rounded-full bg-[#D50000] text-white text-[10px] font-bold flex items-center justify-center">{p.index}</span>
+                                                <div className="min-w-0">
+                                                    <p className="text-slate-800 truncate">{p.locationDescription}{p.isJunction ? ' · corridor junction' : ''}</p>
+                                                    <p className="text-[10px] text-slate-400 font-mono">{p.clauseRef}</p>
+                                                </div>
                                             </div>
-                                        </div>
-                                    ))}
+                                        ))}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <button
-                                onClick={() => { setStep('upload'); setResult(null); setPdfBytes(null); }}
-                                className="w-full border border-slate-300 text-slate-700 py-2.5 text-xs uppercase tracking-widest font-bold hover:border-[#0A192F]"
-                            >
-                                ← Try a Different File
-                            </button>
+                                <button
+                                    onClick={() => { setStep('upload'); setFloors([]); setSkippedFloorWarnings([]); setPdfBytes(null); }}
+                                    className="w-full border border-slate-300 text-slate-700 py-2.5 text-xs uppercase tracking-widest font-bold hover:border-[#0A192F]"
+                                >
+                                    ← Try a Different File
+                                </button>
+                            </div>
                         </div>
                     </div>
                 )}

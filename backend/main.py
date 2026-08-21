@@ -73,10 +73,12 @@ async def lifespan(app: FastAPI):
     _check_ocr_dependencies()
 
     # ── Startup: Log Gemini API key status ──
+    from plan_extractor.scanned_pdf_extractor import GEMINI_MODEL
+
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if gemini_key and gemini_key != "your-key-here":
         print("━" * 60)
-        print("  Gemini vision fallback: ENABLED (key found)")
+        print(f"  Gemini vision fallback: ENABLED (key found, model={GEMINI_MODEL})")
         print("━" * 60)
     else:
         print("━" * 60)

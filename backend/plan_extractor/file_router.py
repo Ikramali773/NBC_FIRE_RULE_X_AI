@@ -14,6 +14,8 @@ from typing import Optional
 
 import pdfplumber
 
+from plan_extractor.page_quality import PAGE_CLASS_TO_ROUTE, classify_page
+
 
 class FileType(str, Enum):
     VECTOR_PDF = "vector_pdf"
@@ -51,29 +53,33 @@ def _is_pdf(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
 
-# Some CAD-to-PDF exporters flatten text to outlined vector paths (no real
-# text objects at all) while still drawing real wall/dimension geometry —
-# a page like that has zero extractable text but thousands of lines/curves.
-# Routing it to OCR anyway is both wrong (there's nothing scanned/rasterized
-# to read) and dangerous: OCR rasterizes every such page at high DPI, which
-# for a real multi-page CAD sheet can be slow/memory-heavy enough to crash
-# or time out the request. A page with substantial vector geometry is
-# "vector" regardless of text length — actually verified against a real
-# 7-page, zero-text-layer CAD export that was previously mis-routed to OCR.
-MIN_VECTOR_PATHS_FOR_VECTOR_PAGE = 200
-
-
 def _classify_pdf_page(page) -> str:
-    """Classify a single PDF page as vector or scanned."""
-    text = (page.extract_text() or "").strip()
-    if len(text) >= 10:
-        return "vector"
+    """
+    Classify a single PDF page as "vector" (native extraction only),
+    "scanned" (OCR only), or "mixed" (no trustworthy text layer but
+    substantial real vector geometry, or text dominated by garbage
+    characters — run both native extraction and OCR and merge).
 
-    path_count = len(page.lines or []) + len(page.rects or []) + len(page.curves or [])
-    if path_count >= MIN_VECTOR_PATHS_FOR_VECTOR_PAGE:
-        return "vector"
+    Delegates to page_quality.classify_page's multi-signal scoring
+    (text length, garbage-char ratio, vector-path density, image count)
+    rather than a single character-count threshold.
 
-    return "scanned"
+    NOTE: an earlier version of this function skipped OCR on a MIXED page
+    when it had zero embedded raster images, reasoning that "nothing was
+    scanned, so there's nothing to read." That reasoning was wrong and has
+    been reverted: OCR runs against a RASTERIZED RENDER of the whole page
+    (via pdf2image/poppler), not against embedded image objects — a page
+    with fonts flattened to vector outlines still renders as legible pixel
+    text once rasterized. Verified directly against ALL_BASIC_DRAWING.pdf
+    (zero embedded images, zero real text objects): OCR-ing its rasterized
+    render recovered "CLIENT ROYAL LANDMARK HOTEL", real dimension figures,
+    and construction notes — none of which native pdfplumber extraction
+    could ever find on this file, since there is no real text layer at
+    all. Skipping OCR here was silently zeroing out the only path capable
+    of reading this file's content.
+    """
+    page_class, _signals = classify_page(page)
+    return PAGE_CLASS_TO_ROUTE[page_class]
 
 
 def route_file(file_bytes: bytes, filename: str) -> RouteResult:
@@ -110,7 +116,11 @@ def route_file(file_bytes: bytes, filename: str) -> RouteResult:
                 for page in pdf.pages:
                     ptype = _classify_pdf_page(page)
                     page_types.append(ptype)
-                    if ptype == "vector":
+                    # "mixed" pages carry a real (if not fully trustworthy)
+                    # text layer and get native extraction too, so for this
+                    # document-level display label they lean "vector" rather
+                    # than splitting the vote or being ignored entirely.
+                    if ptype in ("vector", "mixed"):
                         vector_pages += 1
                     else:
                         scanned_pages += 1
