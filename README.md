@@ -62,14 +62,16 @@ only pages with no extractable text reach the AI fallback chain at all.
    ```
 3. (Optional) Override the Gemini model via `GEMINI_MODEL` if the default needs to change:
    ```env
-   GEMINI_MODEL=gemini-2.5-flash
+   GEMINI_MODEL=gemini-3.6-flash
    ```
-   Google periodically retires Gemini model ids — `gemini-2.5-flash` is confirmed active as of 2026-08 but Google
-   has announced its retirement for 2026-10-16. If Gemini calls start failing with a "not found"/"deprecated"
-   error (visible in the `/api/extract/health-check` response and in extraction warnings), check
-   [the current model list](https://ai.google.dev/gemini-api/docs/models) and update this value — no code change
-   needed. Groq's and OpenRouter's models are selected automatically at call time from their current model
-   listings rather than hardcoded, since free-tier vision model availability rotates on both platforms.
+   Google periodically retires Gemini model ids — `gemini-2.0-flash` was shut down 2026-06-01, and
+   `gemini-2.5-flash` (this project's previous default) started 404ing for new API keys shortly after with
+   Google's own error naming the replacement ("no longer available to new users... use models/gemini-3.6-flash").
+   If Gemini calls start failing with a "not found"/"deprecated" error (visible in the `/api/extract/health-check`
+   response and in extraction warnings), check [the current model list](https://ai.google.dev/gemini-api/docs/models)
+   and update this value — no code change needed. Groq's and OpenRouter's models are selected automatically at
+   call time from their current model listings rather than hardcoded, since free-tier vision model availability
+   rotates on both platforms.
 
 *Note: with zero keys configured, the system works exactly as before — falling back to local Tesseract OCR for
 every scanned page. Every AI-provider-sourced value (Gemini, Groq, OpenRouter, or Mistral) is always capped at

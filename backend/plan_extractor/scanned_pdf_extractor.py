@@ -141,16 +141,17 @@ def _extract_project_name_from_ocr(ocr_text: str) -> Optional[str]:
 
 
 # Model id is environment-configurable, not hardcoded, because Google
-# periodically retires Gemini model ids — "gemini-2.0-flash" (this file's
-# previous hardcoded value) was shut down on 2026-06-01, meaning every
-# Gemini call this pipeline made would have failed outright and silently
-# fallen through to Tesseract on every request, even with a valid API key
-# configured. "gemini-2.5-flash" is the current default: confirmed active
-# as of 2026-08 with a vision-capable multimodal API, though Google has
-# announced its own retirement for 2026-10-16 — GEMINI_MODEL lets a
-# deployer bump this forward with an env change, not a code change, when
-# that happens.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+# periodically retires Gemini model ids. Two real retirements hit this
+# exact default in the same project: "gemini-2.0-flash" was shut down on
+# 2026-06-01, and "gemini-2.5-flash" (this file's next default) started
+# 404ing for new API keys before its own announced 2026-10-16 retirement
+# date — confirmed directly against a real key via the health-check
+# endpoint, with Google's own error naming the replacement: "This model
+# models/gemini-2.5-flash is no longer available to new users. Please
+# update your code to use models/gemini-3.6-flash". "gemini-3.6-flash" is
+# the new default — GEMINI_MODEL lets a deployer bump this forward with an
+# env change, not a code change, whenever it happens again.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
 
 
 def extract_with_gemini(file_bytes: bytes, page_num: int = 0) -> dict:
