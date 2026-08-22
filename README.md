@@ -25,19 +25,42 @@ To use the full capabilities of the extraction module, you must install the foll
    - **Windows**: Install from [UB-Mannheim Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) and add to PATH.
    - **Ubuntu/Debian**: `sudo apt-get install tesseract-ocr`
 
-### Environment Configuration (Gemini Vision Fallback)
+### Environment Configuration (Multi-Provider Vision Fallback Chain)
 
-The pipeline uses Google's Gemini Vision API as an enhanced fallback for scanned/rasterized PDFs. This requires a free-tier API key.
+For scanned/rasterized PDF pages with no real text layer, the pipeline tries up to four free-tier AI vision
+providers in order, before falling back to local Tesseract OCR:
+
+1. **Gemini** (primary)
+2. **Groq** (secondary)
+3. **OpenRouter** free vision models (tertiary)
+4. **Mistral OCR** (quaternary) — specifically the best option for dense, degraded, small-print content (e.g. area/FSI
+   tables on scanned government-approved plans), since it's purpose-built for document OCR rather than general vision chat.
+5. **Tesseract** (guaranteed final fallback) — always works, even with zero keys configured.
+
+Every key below is optional and independent. Leave any subset blank; the chain simply skips that provider and
+falls through to the next one. **Pages pdfplumber can already read directly never go through any of this** —
+only pages with no extractable text reach the AI fallback chain at all.
 
 1. Copy the `.env.example` file in the `backend/` folder to `.env`:
    ```bash
    cp backend/.env.example backend/.env
    ```
-2. Open `backend/.env` and add your Gemini API key (you can get one for free at [Google AI Studio](https://aistudio.google.com/apikey)):
+2. Open `backend/.env` and add whichever keys you have. Each is free-tier:
+
+   | Provider | Get a free key at | Env var |
+   |---|---|---|
+   | Gemini | [Google AI Studio](https://aistudio.google.com/apikey) | `GEMINI_API_KEY` |
+   | Groq | [console.groq.com/keys](https://console.groq.com/keys) | `GROQ_API_KEY` |
+   | OpenRouter | [openrouter.ai/keys](https://openrouter.ai/keys) | `OPENROUTER_API_KEY` |
+   | Mistral | [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys) | `MISTRAL_API_KEY` |
+
    ```env
    GEMINI_API_KEY=your-key-here
+   GROQ_API_KEY=your-key-here
+   OPENROUTER_API_KEY=your-key-here
+   MISTRAL_API_KEY=your-key-here
    ```
-3. (Optional) Override the model via `GEMINI_MODEL` if the default needs to change:
+3. (Optional) Override the Gemini model via `GEMINI_MODEL` if the default needs to change:
    ```env
    GEMINI_MODEL=gemini-2.5-flash
    ```
@@ -45,15 +68,21 @@ The pipeline uses Google's Gemini Vision API as an enhanced fallback for scanned
    has announced its retirement for 2026-10-16. If Gemini calls start failing with a "not found"/"deprecated"
    error (visible in the `/api/extract/health-check` response and in extraction warnings), check
    [the current model list](https://ai.google.dev/gemini-api/docs/models) and update this value — no code change
-   needed.
+   needed. Groq's and OpenRouter's models are selected automatically at call time from their current model
+   listings rather than hardcoded, since free-tier vision model availability rotates on both platforms.
 
-*Note: If no key is provided, the system will gracefully fall back to using local Tesseract OCR for scanned PDFs.
-Gemini is only ever used for pages with no real text layer — pages pdfplumber can already read directly never
-go through this fallback chain at all, and Gemini-sourced values are always capped at amber confidence, never
-green, since they are a single-source AI read of an image rather than an extracted value.*
+*Note: with zero keys configured, the system works exactly as before — falling back to local Tesseract OCR for
+every scanned page. Every AI-provider-sourced value (Gemini, Groq, OpenRouter, or Mistral) is always capped at
+amber confidence, never green, since each is a single-source AI read of an image rather than a directly
+extracted value; the specific provider that answered is always recorded alongside the value.*
 
 ### Health Check
 
-You can verify that all dependencies and the Gemini API key are correctly configured by visiting the health check endpoint while the backend is running:
+Two ways to confirm which providers are actually configured and working, without uploading a real file first:
 
-`GET http://localhost:8000/api/extract/health-check`
+- **Startup log** — when the backend starts, it prints one clear ENABLED/DISABLED line per provider
+  (Gemini, Groq, OpenRouter, Mistral) plus a READY/MISSING line for Tesseract/Poppler.
+- **Health-check endpoint** — makes one minimal, free metadata call per configured provider (never a
+  generation call, so it costs no meaningful quota) to confirm each key is actually valid and not expired/revoked:
+
+  `GET http://localhost:8000/api/extract/health-check`

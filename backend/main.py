@@ -85,6 +85,35 @@ async def lifespan(app: FastAPI):
         print("  Gemini vision fallback: DISABLED (no key set —")
         print("  using Tesseract-only OCR fallback for scanned pages)")
         print("━" * 60)
+
+    # ── Startup: Log Groq / OpenRouter / Mistral key status ──
+    # Same ENABLED/DISABLED pattern as Gemini above, one line per provider,
+    # so the full fallback chain's live status is visible from the
+    # deployment log alone — no file upload needed to check.
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    print("━" * 60)
+    if groq_key and groq_key != "your-key-here":
+        print("  Groq vision fallback: ENABLED (key found)")
+    else:
+        print("  Groq vision fallback: DISABLED (no key)")
+    print("━" * 60)
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    print("━" * 60)
+    if openrouter_key and openrouter_key != "your-key-here":
+        print("  OpenRouter vision fallback: ENABLED (key found)")
+    else:
+        print("  OpenRouter vision fallback: DISABLED (no key)")
+    print("━" * 60)
+
+    mistral_key = os.environ.get("MISTRAL_API_KEY", "").strip()
+    print("━" * 60)
+    if mistral_key and mistral_key != "your-key-here":
+        print("  Mistral OCR fallback: ENABLED (key found)")
+    else:
+        print("  Mistral OCR fallback: DISABLED (no key)")
+    print("━" * 60)
+
     yield
 
 

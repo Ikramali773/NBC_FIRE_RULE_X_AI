@@ -1,6 +1,6 @@
 # backend/routes/extract.py
 # POST /api/extract       — Extract building data from PDF/DWG file
-# GET  /api/extract/health-check — Verify Gemini API key
+# GET  /api/extract/health-check — Verify Gemini/Groq/OpenRouter/Mistral keys
 #
 # This route is part of the new plan extraction module.
 # It does NOT touch engine.py, rule_engine.py, or any rules/*.json.
@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -15,6 +16,12 @@ from plan_extractor.pipeline import run_extraction
 from plan_extractor.scanned_pdf_extractor import GEMINI_MODEL
 
 router = APIRouter()
+
+# Every provider check below is a metadata/listing call, never a generation
+# call — zero token cost, so this endpoint can be hit freely without
+# worrying about quota, per the requirement that it "must not consume
+# meaningful quota."
+_HEALTH_CHECK_TIMEOUT_S = 8
 
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB (DWG files can be large)
 
@@ -104,6 +111,9 @@ async def extraction_health_check():
         "tesseract": "unknown",
         "gemini": "unconfigured",
         "gemini_model": GEMINI_MODEL,
+        "groq": "unconfigured",
+        "openrouter": "unconfigured",
+        "mistral": "unconfigured",
     }
 
     # ── Check pdfplumber ──
@@ -166,5 +176,67 @@ async def extraction_health_check():
             health["gemini"] = f"error (key present but API call failed: {str(e)})"
     else:
         health["gemini"] = "unconfigured (no key — Tesseract-only mode)"
+
+    # ── Check Groq — GET /models is a metadata listing call, zero token cost ──
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if groq_key and groq_key != "your-key-here":
+        try:
+            resp = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {groq_key}"},
+                timeout=_HEALTH_CHECK_TIMEOUT_S,
+            )
+            if resp.status_code == 200:
+                count = len(resp.json().get("data", []))
+                health["groq"] = f"ok (key valid, {count} model(s) listed)"
+            elif resp.status_code == 401:
+                health["groq"] = "error (401 — key invalid or revoked)"
+            else:
+                health["groq"] = f"error (HTTP {resp.status_code}: {resp.text[:200]})"
+        except Exception as e:
+            health["groq"] = f"error (request failed: {str(e)})"
+    else:
+        health["groq"] = "unconfigured (no key — falls through to next provider)"
+
+    # ── Check OpenRouter — GET /key reports the key's own credit/rate info ──
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if openrouter_key and openrouter_key != "your-key-here":
+        try:
+            resp = requests.get(
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {openrouter_key}"},
+                timeout=_HEALTH_CHECK_TIMEOUT_S,
+            )
+            if resp.status_code == 200:
+                health["openrouter"] = "ok (key valid, API responding)"
+            elif resp.status_code == 401:
+                health["openrouter"] = "error (401 — key invalid or revoked)"
+            else:
+                health["openrouter"] = f"error (HTTP {resp.status_code}: {resp.text[:200]})"
+        except Exception as e:
+            health["openrouter"] = f"error (request failed: {str(e)})"
+    else:
+        health["openrouter"] = "unconfigured (no key — falls through to next provider)"
+
+    # ── Check Mistral — GET /models is a metadata listing call, zero token cost ──
+    mistral_key = os.environ.get("MISTRAL_API_KEY", "").strip()
+    if mistral_key and mistral_key != "your-key-here":
+        try:
+            resp = requests.get(
+                "https://api.mistral.ai/v1/models",
+                headers={"Authorization": f"Bearer {mistral_key}"},
+                timeout=_HEALTH_CHECK_TIMEOUT_S,
+            )
+            if resp.status_code == 200:
+                count = len(resp.json().get("data", []))
+                health["mistral"] = f"ok (key valid, {count} model(s) listed)"
+            elif resp.status_code == 401:
+                health["mistral"] = "error (401 — key invalid or revoked)"
+            else:
+                health["mistral"] = f"error (HTTP {resp.status_code}: {resp.text[:200]})"
+        except Exception as e:
+            health["mistral"] = f"error (request failed: {str(e)})"
+    else:
+        health["mistral"] = "unconfigured (no key — falls through to Tesseract)"
 
     return JSONResponse(content=health)
