@@ -426,3 +426,279 @@ class TestGeminiFallbackReasonCategorization:
         result = spe.extract_with_gemini(b"irrelevant", page_num=0)
         assert result["success"] is False
         assert "rate limit/quota exceeded" in result["error"]
+
+
+class _FakeHTTPResponse:
+    def __init__(self, status_code=200, json_data=None, text=""):
+        self.status_code = status_code
+        self._json_data = json_data or {}
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._json_data
+
+
+class TestGroqModelDiscovery:
+    """_pick_groq_vision_model verifies liveness against Groq's real model
+    list rather than trusting a hardcoded id — Groq has deprecated its
+    vision lineup (Llama 4 Scout/Maverick) before without notice."""
+
+    def _reset_cache(self):
+        import plan_extractor.scanned_pdf_extractor as spe
+        spe._groq_model_cache.update(model=None, error=None, ts=0.0)
+
+    def test_uses_preferred_model_when_still_listed(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+        monkeypatch.setattr(spe.requests, "get", lambda *a, **k: _FakeHTTPResponse(
+            json_data={"data": [{"id": "qwen/qwen3.6-27b"}, {"id": "llama-3.1-8b-instant"}]}
+        ))
+        model, err = spe._pick_groq_vision_model("fake-key")
+        assert model == "qwen/qwen3.6-27b"
+        assert err is None
+
+    def test_falls_back_to_another_vision_hinted_model_if_preferred_gone(self, monkeypatch):
+        """Regression scenario: exactly what happened to Llama 4 Scout/
+        Maverick — the preferred model disappears from the list entirely."""
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+        monkeypatch.setattr(spe.requests, "get", lambda *a, **k: _FakeHTTPResponse(
+            json_data={"data": [{"id": "some-new-qwen-vl-model"}, {"id": "llama-3.1-8b-instant"}]}
+        ))
+        model, err = spe._pick_groq_vision_model("fake-key")
+        assert model == "some-new-qwen-vl-model"
+        assert err is None
+
+    def test_returns_error_when_no_vision_capable_model_listed(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+        monkeypatch.setattr(spe.requests, "get", lambda *a, **k: _FakeHTTPResponse(
+            json_data={"data": [{"id": "llama-3.1-8b-instant"}]}
+        ))
+        model, err = spe._pick_groq_vision_model("fake-key")
+        assert model is None
+        assert "no longer listed" in err
+
+    def test_returns_error_when_request_fails(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+
+        def _raise(*a, **k):
+            raise Exception("connection refused")
+
+        monkeypatch.setattr(spe.requests, "get", _raise)
+        model, err = spe._pick_groq_vision_model("fake-key")
+        assert model is None
+        assert "connection refused" in err
+
+
+class TestOpenRouterModelDiscovery:
+    def _reset_cache(self):
+        import plan_extractor.scanned_pdf_extractor as spe
+        spe._openrouter_model_cache.update(model=None, error=None, ts=0.0)
+
+    def test_uses_preferred_model_when_still_free_and_listed(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+        monkeypatch.setattr(spe.requests, "get", lambda *a, **k: _FakeHTTPResponse(json_data={"data": [
+            {"id": "qwen/qwen2.5-vl-72b-instruct:free", "pricing": {"prompt": "0"},
+             "architecture": {"modality": "text+image->text"}},
+            {"id": "some-paid-model", "pricing": {"prompt": "0.001"}, "architecture": {"modality": "text->text"}},
+        ]}))
+        model, err = spe._pick_openrouter_free_vision_model()
+        assert model == "qwen/qwen2.5-vl-72b-instruct:free"
+        assert err is None
+
+    def test_falls_back_to_any_free_image_capable_model(self, monkeypatch):
+        """Regression scenario: OpenRouter's free-tier lineup rotates — the
+        preferred model is gone but a different free vision model is listed."""
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+        monkeypatch.setattr(spe.requests, "get", lambda *a, **k: _FakeHTTPResponse(json_data={"data": [
+            {"id": "some-other-vl-model:free", "pricing": {"prompt": "0"},
+             "architecture": {"modality": "text+image->text"}},
+            {"id": "text-only-free-model:free", "pricing": {"prompt": "0"},
+             "architecture": {"modality": "text->text"}},
+        ]}))
+        model, err = spe._pick_openrouter_free_vision_model()
+        assert model == "some-other-vl-model:free"
+        assert err is None
+
+    def test_returns_error_when_no_free_vision_model_listed(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        self._reset_cache()
+        monkeypatch.setattr(spe.requests, "get", lambda *a, **k: _FakeHTTPResponse(json_data={"data": [
+            {"id": "paid-vl-model", "pricing": {"prompt": "0.002"}, "architecture": {"modality": "text+image->text"}},
+        ]}))
+        model, err = spe._pick_openrouter_free_vision_model()
+        assert model is None
+        assert "No free, image-input-capable model" in err
+
+
+class TestExtractWithGroq:
+    def test_no_key_skips_immediately(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        result = spe.extract_with_groq(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "No Groq API key set" in result["error"]
+
+    def test_model_discovery_failure_is_reported(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.setenv("GROQ_API_KEY", "fake-key")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+        monkeypatch.setattr(spe, "_pick_groq_vision_model", lambda api_key: (None, "no models listed"))
+        result = spe.extract_with_groq(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "No usable Groq vision model" in result["error"]
+
+    def test_successful_call_produces_tagged_data(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.setenv("GROQ_API_KEY", "fake-key")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+        monkeypatch.setattr(spe, "_pick_groq_vision_model", lambda api_key: ("qwen/qwen3.6-27b", None))
+        monkeypatch.setattr(
+            spe, "_call_openai_compatible_vision",
+            lambda **kwargs: ('{"building_height_m": 15.0, "floor_count": 4}', None),
+        )
+        result = spe.extract_with_groq(b"irrelevant", page_num=0)
+        assert result["success"] is True
+        assert result["data"]["height"] == {"value": 15.0, "source": "groq_vision"}
+        assert result["data"]["floors"] == {"value": 4, "source": "groq_vision"}
+
+
+class TestExtractWithOpenRouter:
+    def test_no_key_skips_immediately(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = spe.extract_with_openrouter(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "No OpenRouter API key set" in result["error"]
+
+    def test_call_failure_is_categorized(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+        monkeypatch.setattr(spe, "_pick_openrouter_free_vision_model", lambda: ("qwen/qwen2.5-vl-72b-instruct:free", None))
+        monkeypatch.setattr(spe, "_call_openai_compatible_vision", lambda **kwargs: (None, "401 Unauthorized: invalid key"))
+        result = spe.extract_with_openrouter(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "API key invalid/revoked" in result["error"]
+
+
+class TestExtractWithMistral:
+    def test_no_key_skips_immediately(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        result = spe.extract_with_mistral(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "No Mistral API key set" in result["error"]
+
+    def test_successful_ocr_reuses_plain_text_field_extraction(self, monkeypatch):
+        """Mistral OCR returns raw markdown text (not custom-prompted JSON,
+        unlike Gemini/Groq/OpenRouter), so it must go through the same
+        regex-based field extraction Tesseract uses — verified here by
+        checking a recognizable field (kitchen keyword) comes through
+        tagged with the Mistral-specific source, not "tesseract_ocr"."""
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+        monkeypatch.setattr(spe.requests, "post", lambda *a, **k: _FakeHTTPResponse(
+            json_data={"pages": [{"markdown": "PROJECT NAME: Test Tower\nKITCHEN AREA 12 SQM"}]}
+        ))
+        result = spe.extract_with_mistral(b"irrelevant", page_num=0)
+        assert result["success"] is True
+        assert result["data"]["kitchen"] is True
+        assert result["raw_text"] == "PROJECT NAME: Test Tower\nKITCHEN AREA 12 SQM"
+
+    def test_http_failure_is_categorized(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
+        monkeypatch.setattr(spe, "_rasterize_pdf_page", lambda *a, **k: (b"fake-png-bytes", None))
+
+        def _raise(*a, **k):
+            raise Exception("429 rate limit exceeded")
+
+        monkeypatch.setattr(spe.requests, "post", _raise)
+        result = spe.extract_with_mistral(b"irrelevant", page_num=0)
+        assert result["success"] is False
+        assert "rate limit/quota exceeded" in result["error"]
+
+
+class TestProviderFallbackChainOrdering:
+    """extract_from_scanned_pdf's orchestration loop: tries every
+    configured provider in order, stops at the first success, and never
+    calls a provider whose key isn't set at all."""
+
+    @staticmethod
+    def _make_stub(name, succeed, calls):
+        empty_data = {
+            "height": None, "floors": None, "areas": [], "scale": None,
+            "project_name": None, "occupancy_hint": None, "construction_keywords": [],
+            "kitchen": None, "sprinklers": None, "basement_levels": None,
+            "floor_labels": [], "room_labels": [], "dimensions": [],
+        }
+
+        def stub(file_bytes, page_num=0):
+            calls.append(name)
+            if succeed:
+                return {"success": True, "source_stage": f"stage_{name}", "data": dict(empty_data),
+                        "raw_text": "", "error": None}
+            return {"success": False, "source_stage": f"stage_{name}", "data": {},
+                    "raw_text": "", "error": f"{name} failed on purpose"}
+        return stub
+
+    def test_stops_at_first_success_and_skips_later_providers(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        calls = []
+        monkeypatch.setenv("GEMINI_API_KEY", "fake")
+        monkeypatch.setenv("GROQ_API_KEY", "fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "fake")
+        monkeypatch.setenv("MISTRAL_API_KEY", "fake")
+        monkeypatch.setattr(spe, "_PROVIDER_CHAIN", [
+            ("stage_gemini", "Gemini", "GEMINI_API_KEY", self._make_stub("gemini", False, calls)),
+            ("stage_groq", "Groq", "GROQ_API_KEY", self._make_stub("groq", False, calls)),
+            ("stage_openrouter", "OpenRouter", "OPENROUTER_API_KEY", self._make_stub("openrouter", True, calls)),
+            ("stage_mistral", "Mistral OCR", "MISTRAL_API_KEY", self._make_stub("mistral", True, calls)),
+            ("stage_tesseract", "Tesseract", None, self._make_stub("tesseract", True, calls)),
+        ])
+
+        result = spe.extract_from_scanned_pdf(b"irrelevant", page_numbers=[0])
+
+        assert calls == ["gemini", "groq", "openrouter"]  # stopped after openrouter succeeded
+        assert result["source_stage"] == "stage_openrouter"
+        assert result["provider_usage"]["Gemini"] == {"attempted": 1, "succeeded": 0}
+        assert result["provider_usage"]["Groq"] == {"attempted": 1, "succeeded": 0}
+        assert result["provider_usage"]["OpenRouter"] == {"attempted": 1, "succeeded": 1}
+        assert result["provider_usage"]["Mistral OCR"] == {"attempted": 0, "succeeded": 0}
+        assert result["provider_usage"]["Tesseract"] == {"attempted": 0, "succeeded": 0}
+        assert any("gemini failed on purpose" in w for w in result["warnings"])
+        assert any("groq failed on purpose" in w for w in result["warnings"])
+
+    def test_unconfigured_providers_are_skipped_without_being_called(self, monkeypatch):
+        import plan_extractor.scanned_pdf_extractor as spe
+        calls = []
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.setattr(spe, "_PROVIDER_CHAIN", [
+            ("stage_gemini", "Gemini", "GEMINI_API_KEY", self._make_stub("gemini", True, calls)),
+            ("stage_groq", "Groq", "GROQ_API_KEY", self._make_stub("groq", True, calls)),
+            ("stage_openrouter", "OpenRouter", "OPENROUTER_API_KEY", self._make_stub("openrouter", True, calls)),
+            ("stage_mistral", "Mistral OCR", "MISTRAL_API_KEY", self._make_stub("mistral", True, calls)),
+            ("stage_tesseract", "Tesseract", None, self._make_stub("tesseract", True, calls)),
+        ])
+
+        result = spe.extract_from_scanned_pdf(b"irrelevant", page_numbers=[0])
+
+        # None of the 4 keyed providers were even called — only Tesseract,
+        # which has no key gate — even though every stub would "succeed."
+        assert calls == ["tesseract"]
+        assert result["source_stage"] == "stage_tesseract"
+        assert all(v == {"attempted": 0, "succeeded": 0} for k, v in result["provider_usage"].items() if k != "Tesseract")
+        assert result["warnings"] == []  # no noise for the common all-keys-blank case

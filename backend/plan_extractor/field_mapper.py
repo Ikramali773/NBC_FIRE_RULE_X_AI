@@ -110,6 +110,28 @@ def _map_construction_type(ct_data: Optional[dict]) -> dict:
     return field
 
 
+# Maps a per-value "source" tag substring to a human-readable label for
+# field notes — one lookup shared by every AI-provider-sourced field
+# instead of a hand-written elif per provider, so a new provider added to
+# the Stage 5 fallback chain doesn't need a matching edit here to get a
+# sensible note (it just falls through to the generic "Detected from
+# drawing text" case below).
+_AI_VISION_SOURCE_LABELS = {
+    "gemini": "Gemini vision",
+    "groq": "Groq vision",
+    "openrouter": "OpenRouter vision",
+    "mistral": "Mistral OCR",
+    "tesseract": "OCR keyword match",
+}
+
+
+def _ai_provider_note(source: str) -> str:
+    for key, label in _AI_VISION_SOURCE_LABELS.items():
+        if key in source:
+            return f"Detected by {label} — verify this value"
+    return "Detected from drawing text"
+
+
 def _field(value, confidence: str, source_stage: str, note: str = "") -> dict:
     """Create a standard field output dict."""
     return {
@@ -193,15 +215,9 @@ def map_to_form_fields(
             if source in ("text_label", "dxf_text"):
                 height_confidence = "green"
                 height_note = f"Extracted from explicit text label: {height_data.get('raw', '')}"
-            elif "gemini" in source:
-                height_confidence = "amber"
-                height_note = "Detected by Gemini vision — verify this value"
-            elif "tesseract" in source:
-                height_confidence = "amber"
-                height_note = "Detected by OCR keyword match — verify this value"
             else:
                 height_confidence = "amber"
-                height_note = "Detected from drawing text"
+                height_note = _ai_provider_note(source)
             height_source = source
 
     # ── Floors ──
@@ -218,11 +234,9 @@ def map_to_form_fields(
             if source in ("text_label", "dxf_text"):
                 floors_confidence = "green"
                 floors_note = f"Extracted from text: {floors_data.get('raw', '')}"
-            elif "gemini" in source:
-                floors_confidence = "amber"
-                floors_note = "Detected by Gemini vision — verify"
             else:
                 floors_confidence = "amber"
+                floors_note = _ai_provider_note(source)
             floors_source = source
 
     # ── Areas ──
