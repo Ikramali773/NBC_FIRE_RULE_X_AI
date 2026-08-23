@@ -170,6 +170,16 @@ def _extract_project_name_from_ocr(ocr_text: str) -> Optional[str]:
 # env change, not a code change, whenever it happens again.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
 
+# Shared request timeout for every AI vision-provider call in the fallback
+# chain. Deliberately bounded and fairly tight: with up to 4 AI providers
+# tried in order before Tesseract, across up to MAX_OCR_PAGES_PER_REQUEST
+# pages, an unbounded or generous per-call timeout compounds into a very
+# long worst-case request when several providers fail/are slow on the same
+# page — a real, reported case of the whole request timing out upstream
+# (reverse proxy / client) traced back to exactly this. 30s is generous for
+# a single-image vision call while keeping that worst case bounded.
+VISION_PROVIDER_TIMEOUT_S = int(os.environ.get("VISION_PROVIDER_TIMEOUT_S", "30"))
+
 # Shared by every "smart" vision provider (Gemini, Groq, OpenRouter) — all
 # three are general vision-language chat models capable of following a
 # custom extraction prompt and returning structured JSON, unlike Mistral's
@@ -335,6 +345,7 @@ def extract_with_gemini(file_bytes: bytes, page_num: int = 0) -> dict:
                 temperature=0.1,
                 max_output_tokens=2000,
             ),
+            request_options={"timeout": VISION_PROVIDER_TIMEOUT_S},
         )
 
         response_text = _strip_json_fences(response.text)
@@ -368,7 +379,7 @@ def _call_openai_compatible_vision(
     prompt: str,
     extra_headers: Optional[dict] = None,
     use_json_mode: bool = False,
-    timeout_s: int = 60,
+    timeout_s: int = VISION_PROVIDER_TIMEOUT_S,
 ) -> tuple[Optional[str], Optional[str]]:
     """Returns (response_text, error). use_json_mode requests strict JSON
     output via response_format — only passed when the specific model/
@@ -636,7 +647,7 @@ def extract_with_mistral(file_bytes: bytes, page_num: int = 0) -> dict:
                 "model": _MISTRAL_OCR_MODEL,
                 "document": {"type": "image_url", "image_url": f"data:image/png;base64,{b64}"},
             },
-            timeout=60,
+            timeout=VISION_PROVIDER_TIMEOUT_S,
         )
         resp.raise_for_status()
         payload = resp.json()
