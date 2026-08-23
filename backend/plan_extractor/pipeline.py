@@ -164,17 +164,31 @@ def run_extraction(file_bytes: bytes, filename: str) -> dict:
             result["warnings"].extend(extraction_data.get("warnings", []))
 
             if scanned_result:
-                if scanned_result.get("gemini_attempted"):
-                    if scanned_result.get("gemini_succeeded"):
-                        result["warnings"].append("Used Gemini vision for scanned page(s).")
-                    else:
-                        result["warnings"].append(
-                            f"Gemini failed on scanned page(s), fell back to Tesseract. "
-                            f"Reason: {scanned_result.get('fallback_reason', 'unknown')}"
-                        )
+                # Summarize which provider in the 5-stage AI fallback chain
+                # (Gemini -> Groq -> OpenRouter -> Mistral OCR -> Tesseract)
+                # actually answered — per-page failure reasons are already
+                # itemized in scanned_result["warnings"] (merged in above),
+                # this is just the one-line overall outcome.
+                _STAGE_LABELS = {
+                    "5a_gemini": "Gemini", "5b_groq": "Groq", "5c_openrouter": "OpenRouter",
+                    "5d_mistral": "Mistral OCR", "5e_tesseract": "Tesseract",
+                }
+                winner = _STAGE_LABELS.get(scanned_result.get("source_stage"), "Tesseract")
+                usage = scanned_result.get("provider_usage", {})
+                ai_attempted = [
+                    name for name in ("Gemini", "Groq", "OpenRouter", "Mistral OCR")
+                    if usage.get(name, {}).get("attempted")
+                ]
+
+                if winner != "Tesseract":
+                    result["warnings"].append(f"Used {winner} vision for scanned page(s).")
+                elif ai_attempted:
+                    result["warnings"].append(
+                        f"{', '.join(ai_attempted)} failed on scanned page(s); fell back to Tesseract OCR."
+                    )
                 else:
                     result["warnings"].append(
-                        "No Gemini API key configured — used Tesseract OCR for scanned page(s)."
+                        "No Gemini/Groq/OpenRouter/Mistral API key configured — used Tesseract OCR for scanned page(s)."
                     )
 
         # ━━━ Stage 4 → 3: DWG → DXF ━━━
