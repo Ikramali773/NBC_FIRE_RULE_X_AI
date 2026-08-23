@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
@@ -108,6 +110,7 @@ async def extraction_health_check():
         "ezdxf": "unknown",
         "dwg2dxf": "unknown",
         "pdf2image": "unknown",
+        "poppler": "unknown",
         "tesseract": "unknown",
         "gemini": "unconfigured",
         "gemini_model": GEMINI_MODEL,
@@ -139,11 +142,33 @@ async def extraction_health_check():
         health["dwg2dxf"] = f"error: {str(e)}"
 
     # ── Check pdf2image ──
+    # This only confirms the Python package imports — it does NOT confirm
+    # the actual pdftoppm/pdfinfo binaries it wraps are installed. Real
+    # rasterization failures ("Poppler binary not found") were observed in
+    # production with this showing "ok", which is exactly why "poppler" is
+    # checked as its own separate, real subprocess check below.
     try:
         import pdf2image
-        health["pdf2image"] = "ok"
+        health["pdf2image"] = "ok (package only — see 'poppler' for the actual binary)"
     except ImportError:
         health["pdf2image"] = "not installed"
+
+    # ── Check Poppler (pdftoppm) — the actual rasterization binary EVERY
+    # Stage 5 provider depends on before its own logic ever runs (Gemini,
+    # Groq, OpenRouter, Mistral OCR, and Tesseract all rasterize the page
+    # via Poppler first) ──
+    poppler_path = shutil.which("pdftoppm")
+    if poppler_path is None:
+        health["poppler"] = (
+            "not found on PATH — every Stage 5 provider (Gemini/Groq/OpenRouter/Mistral/Tesseract) "
+            "will fail identically until this is installed (see README: poppler-utils)"
+        )
+    else:
+        try:
+            subprocess.run(["pdftoppm", "-v"], capture_output=True, timeout=10)
+            health["poppler"] = f"ok ({poppler_path})"
+        except Exception as e:
+            health["poppler"] = f"found on PATH but failed to run: {e}"
 
     # ── Check tesseract ──
     try:

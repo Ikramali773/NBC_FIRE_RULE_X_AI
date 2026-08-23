@@ -136,7 +136,15 @@ export default function NewAnalysisPage() {
             const response = await fetch(`${API_URL}/api/extract`, {
                 method: 'POST',
                 body: formData,
-                signal: AbortSignal.timeout(180000),
+                // The backend's scanned-page fallback chain now tries up to
+                // four AI vision providers (Gemini -> Groq -> OpenRouter ->
+                // Mistral OCR) before Tesseract, per scanned page (up to
+                // MAX_OCR_PAGES_PER_REQUEST=5) — a multi-page scanned file
+                // where several providers fail before one succeeds can
+                // legitimately take several minutes. 180s (this call's
+                // previous timeout, from when the chain was just Gemini
+                // then Tesseract) was cutting real requests off mid-flight.
+                signal: AbortSignal.timeout(600000),
             });
 
             timers.forEach(clearTimeout);
